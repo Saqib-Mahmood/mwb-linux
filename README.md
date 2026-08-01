@@ -379,6 +379,8 @@ scripts/
 - **First connection** — Initial handshake takes ~3-16s depending on Windows MWB state; subsequent reconnects are instant
 - **Self-update is disabled** — upstream release binaries carry the older
   fixed-salt crypto and cannot talk to a current PowerToys peer. Rebuild from source.
+- **Setup, persistence and every pitfall are documented in [SETUP.md](SETUP.md)**;
+  `./scripts/install.sh` performs the whole install on a fresh machine.
 - **Bidirectional mode requires X11** — Edge detection uses `xdotool`. (Device isolation itself is display-server agnostic: `EVIOCGRAB` works identically on X11, Wayland and the console.) Receive-only mode works on Wayland (XWayland session). Native Wayland bidirectional support requires compositor extensions and is not yet implemented.
 - **Keyboard layout metadata** — PowerToys MWB keyboard packets carry Windows virtual-key codes and flags, but not hardware scan codes or Unicode text. MWB Linux uses `keyboard_layout` profiles for common layouts; unsupported profiles fall back to the original US-compatible mapping. Fully zero-config global layout support requires sender-side scan code or Unicode metadata.
 - **File copy is one file at a time** — Matching MWB itself, folders and

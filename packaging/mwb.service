@@ -1,17 +1,32 @@
 [Unit]
-Description=Mouse Without Borders Linux client
-After=network-online.target graphical.target
-Wants=network-online.target
+Description=Mouse Without Borders client (Linux peer for PowerToys MWB)
+Documentation=https://github.com/lucky-verma/mwb-linux
+
+# Retry forever. StartLimitIntervalSec MUST live in [Unit] — put it in [Service]
+# and systemd silently ignores it, leaving the default 5-starts-in-10s limiter
+# in place. Once that trips the unit gives up for good, which is wrong here: the
+# peer is routinely absent for long stretches (Windows asleep, cable unplugged,
+# firewall) and we just want to keep trying.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-# DISPLAY and XAUTHORITY are auto-detected by the mwb binary at startup.
-# Override here only if auto-detection fails for your setup.
-# Environment=DISPLAY=:1
-# Environment=XAUTHORITY=/run/user/1000/gdm/Xauthority
-ExecStart=/usr/local/bin/mwb
-Restart=on-failure
+ExecStart=%h/.local/bin/mwb
+Restart=always
 RestartSec=5
+
+# This is a *user* unit on purpose. mwb needs the X display for edge detection
+# and the clipboard, plus the user's own /dev/uinput access. A system unit would
+# have neither, and would run the network code as root.
+#
+# It hangs off default.target rather than graphical-session.target because some
+# desktops — XFCE among them — never activate graphical-session.target, so a
+# unit wanted by it never starts. Consequence: this can start before X is ready.
+# The restart loop above covers that.
+Environment=DISPLAY=:0
+# Uncomment if the clipboard or edge detection cannot reach the display
+# (multiple X servers, or a display manager that keeps the auth file elsewhere):
+# Environment=XAUTHORITY=%h/.Xauthority
 
 [Install]
 WantedBy=default.target

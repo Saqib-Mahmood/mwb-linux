@@ -1,141 +1,163 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# Install this MWB client on a Linux machine, from source.
+#
+#     ./scripts/install.sh
+#
+# Idempotent — safe to re-run after a git pull to upgrade in place.
+#
+# It deliberately BUILDS rather than downloading a release. Upstream release
+# binaries implement the pre-June-2026 MWB crypto (a fixed PBKDF2 salt and a
+# fixed IV) and cannot handshake against a current PowerToys build, so fetching
+# one would silently break the link. See SETUP.md.
+#
+# What it does, and which parts need root:
+#
+#   as you        build the binary                 -> ~/.local/bin/mwb
+#   as you        write a config template          -> ~/.config/mwb/config.toml
+#   as you        install and enable a user unit   -> ~/.config/systemd/user/
+#   root (sudo)   load the uinput module, persist it
+#   root (sudo)   udev rules for /dev/uinput
+#   root (sudo)   add you to the 'input' group
+#
+# The root steps are skipped with a clear message when sudo is unavailable, so
+# the unprivileged parts still complete.
+
 set -euo pipefail
 
-REPO="lucky-verma/mwb-linux"
-VERSION="${MWB_VERSION:-latest}"
-INSTALL_DIR="/usr/local/bin"
-BINARY_NAME="mwb"
+say()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+ok()   { printf '  \033[32mok\033[0m    %s\n' "$*"; }
+warn() { printf '  \033[33mwarn\033[0m  %s\n' "$*"; }
+die()  { printf '\033[31merror\033[0m %s\n' "$*" >&2; exit 1; }
 
-echo "=== MWB Linux Installer ==="
-echo ""
+[ "$(id -u)" -ne 0 ] || die "Run as your normal user, not root — it calls sudo where needed."
 
-if [ "${EUID}" -ne 0 ]; then
-    echo "Please run with sudo: curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install.sh | sudo bash"
-    exit 1
+REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$REPO_ROOT"
+
+BIN_DIR="$HOME/.local/bin"
+CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/mwb"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+
+# ── 1. Toolchain ──────────────────────────────────────────────────────────────
+say "Looking for Go"
+GO=""
+if command -v go >/dev/null 2>&1; then
+    GO=$(command -v go)
+else
+    for cand in "$HOME/.local/go/bin/go" /usr/local/go/bin/go /usr/lib/go/bin/go; do
+        [ -x "$cand" ] && { GO="$cand"; break; }
+    done
 fi
+[ -n "$GO" ] || die "Go not found. Either:
+    sudo apt install golang-go
+or install it without root:
+    V=\$(curl -sS 'https://go.dev/VERSION?m=text' | head -1)
+    curl -sSL -o /tmp/go.tgz \"https://dl.google.com/go/\${V}.linux-amd64.tar.gz\"
+    mkdir -p ~/.local && tar -C ~/.local -xzf /tmp/go.tgz
+then re-run this script."
+ok "$("$GO" version)"
 
-ACTUAL_USER="${SUDO_USER:-$USER}"
-USER_HOME="$(getent passwd "${ACTUAL_USER}" | cut -d: -f6)"
-if [ -z "${USER_HOME}" ]; then
-    echo "Could not determine home directory for ${ACTUAL_USER}"
-    exit 1
-fi
-
-case "$(uname -m)" in
-    x86_64 | amd64)
-        ARCH="amd64"
-        ;;
-    aarch64 | arm64)
-        ARCH="arm64"
-        ;;
-    *)
-        echo "Unsupported architecture: $(uname -m)"
-        exit 1
-        ;;
+# ── 2. Build ──────────────────────────────────────────────────────────────────
+say "Building"
+"$GO" build -o mwb ./cmd/mwb
+install -Dm755 mwb "$BIN_DIR/mwb"
+ok "installed $BIN_DIR/mwb"
+case ":$PATH:" in
+    *":$BIN_DIR:"*) : ;;
+    *) warn "$BIN_DIR is not on your PATH. Add to ~/.profile or ~/.zshrc:
+           export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
 esac
 
-if [ "${VERSION}" = "latest" ]; then
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/mwb-linux-${ARCH}"
+# ── 3. Runtime helpers ────────────────────────────────────────────────────────
+say "Runtime dependencies"
+missing=""
+for tool in xdotool xclip; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+if [ -n "$missing" ]; then
+    warn "missing:$missing — needed for edge detection (xdotool) and clipboard (xclip)"
+    warn "install with:  sudo apt install$missing"
 else
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/mwb-linux-${ARCH}"
+    ok "xdotool, xclip present"
 fi
 
-echo "[1/6] Installing dependencies..."
-apt-get update -qq
-apt-get install -y -qq ca-certificates curl xdotool xclip x11-xserver-utils > /dev/null
-echo "  Done."
-
-echo "[2/6] Configuring input permissions..."
-modprobe uinput
-echo 'uinput' > /etc/modules-load.d/uinput.conf
-cat > /etc/udev/rules.d/99-mwb-uinput.rules << 'EOF'
-KERNEL=="uinput", GROUP="input", MODE="0660"
-EOF
-cat > /etc/udev/rules.d/99-mwb-libinput.rules << 'EOF'
-# mwb virtual mouse: tell libinput not to apply pointer acceleration.
-# The device receives absolute coordinates over the network; bursty
-# packet timing produces variable input deltas. libinput's default
-# adaptive accel curve amplifies that variance into visible cursor
-# wobble on Wayland (issue #5). Flat profile = linear 1:1 mapping.
-ACTION=="add|change", SUBSYSTEM=="input", ATTRS{name}=="mwb-mouse", ENV{LIBINPUT_ACCEL_PROFILE}="flat", ENV{LIBINPUT_ACCEL_SPEED}="0"
-EOF
-udevadm control --reload-rules
-udevadm trigger /dev/uinput 2>/dev/null || true
-echo "  Done."
-
-echo "[3/6] Adding ${ACTUAL_USER} to input group..."
-usermod -aG input "${ACTUAL_USER}"
-echo "  Done."
-
-echo "[4/6] Installing mwb ${VERSION} (${ARCH})..."
-TMP_FILE="$(mktemp)"
-trap 'rm -f "${TMP_FILE}"' EXIT
-curl -fsSL "${DOWNLOAD_URL}" -o "${TMP_FILE}"
-install -D -m 755 "${TMP_FILE}" "${INSTALL_DIR}/${BINARY_NAME}"
-echo "  Installed to ${INSTALL_DIR}/${BINARY_NAME}"
-
-echo "[5/6] Creating config template..."
-CONFIG_DIR="${USER_HOME}/.config/mwb"
-mkdir -p "${CONFIG_DIR}"
-if [ ! -f "${CONFIG_DIR}/config.toml" ]; then
-    cat > "${CONFIG_DIR}/config.toml" << 'EOF'
-# MWB Linux Configuration
-# Get the security key from PowerToys -> Mouse Without Borders on Windows.
-
-host = "192.168.1.100"        # Windows machine IP address
-key = "YourSecurityKey"       # Security key from PowerToys MWB
-name = "linux"                # This machine's name (max 15 chars)
-# port = 15100                # Base port (default 15100)
-# accel_multiplier = 2.0      # Linux -> Windows cursor speed
-# inbound_multiplier = 1.0    # Windows -> Linux cursor speed
-EOF
-    echo "  Config template created at ${CONFIG_DIR}/config.toml"
+# ── 4. Config ─────────────────────────────────────────────────────────────────
+say "Config"
+mkdir -p "$CFG_DIR"
+chmod 700 "$CFG_DIR"
+if [ -f "$CFG_DIR/config.toml" ]; then
+    ok "keeping existing $CFG_DIR/config.toml"
 else
-    echo "  Config already exists at ${CONFIG_DIR}/config.toml"
+    install -m600 packaging/config.example.toml "$CFG_DIR/config.toml"
+    ok "template written to $CFG_DIR/config.toml"
+    warn "EDIT IT: set host, key and name before starting the service."
 fi
-# The config holds the plaintext security key — keep it owner-only so no other
-# local account can read it (0700 dir, 0600 file).
-chown "${ACTUAL_USER}:${ACTUAL_USER}" "${CONFIG_DIR}"
-chmod 700 "${CONFIG_DIR}"
-chown "${ACTUAL_USER}:${ACTUAL_USER}" "${CONFIG_DIR}/config.toml"
-chmod 600 "${CONFIG_DIR}/config.toml"
+# The file holds the plaintext shared key; keep it owner-only.
+chmod 600 "$CFG_DIR/config.toml"
 
-echo "[6/6] Installing systemd user service..."
-if command -v systemctl >/dev/null 2>&1 && \
-    systemctl list-unit-files --no-legend mwb-linux.service 2>/dev/null | grep -q '^mwb-linux\.service'; then
-    echo "  Removing legacy root mwb-linux.service..."
-    systemctl disable --now mwb-linux.service >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/mwb-linux.service
-    rm -rf /etc/systemd/system/mwb-linux.service.d
-    systemctl daemon-reload || true
+# ── 5. Privileged bits ────────────────────────────────────────────────────────
+say "Input device permissions (needs root)"
+if ! sudo -v 2>/dev/null; then
+    warn "sudo unavailable — skipped. Run scripts/setup-uinput.sh as root later,"
+    warn "or mwb will fail at startup with 'error creating virtual mouse'."
+else
+    sudo sh -c 'printf "uinput\n" > /etc/modules-load.d/uinput.conf'
+    sudo modprobe uinput 2>/dev/null || warn "modprobe uinput failed (built into the kernel?)"
+    sudo install -m644 packaging/99-mwb.rules          /etc/udev/rules.d/99-mwb.rules
+    sudo install -m644 packaging/99-mwb-libinput.rules /etc/udev/rules.d/99-mwb-libinput.rules
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger --subsystem-match=misc
+    sudo udevadm trigger --subsystem-match=input
+    ok "uinput module + udev rules installed"
+
+    if id -nG "$USER" | tr ' ' '\n' | grep -qx input; then
+        ok "already in the 'input' group"
+    else
+        sudo usermod -aG input "$USER"
+        ok "added $USER to the 'input' group"
+        warn "REBOOT REQUIRED — see the note below."
+    fi
 fi
 
-install -d /etc/systemd/user
-cat > /etc/systemd/user/mwb.service << 'EOF'
-[Unit]
-Description=Mouse Without Borders for Linux
-After=graphical-session.target network-online.target
-Wants=network-online.target
+# ── 6. Service ────────────────────────────────────────────────────────────────
+say "Auto-start service"
+mkdir -p "$UNIT_DIR"
+install -m644 packaging/mwb.service "$UNIT_DIR/mwb.service"
+systemctl --user daemon-reload
+systemctl --user enable mwb.service >/dev/null
+ok "enabled — Restart=always, RestartSec=5, start-rate limiter disabled"
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/mwb
-Restart=on-failure
-RestartSec=5
-# DISPLAY and XAUTHORITY are auto-detected by the mwb binary.
+# ── 7. Report ─────────────────────────────────────────────────────────────────
+echo
+say "Installed"
+printf '  %-24s %s\n' "binary"         "$BIN_DIR/mwb"
+printf '  %-24s %s\n' "config"         "$CFG_DIR/config.toml"
+printf '  %-24s %s\n' "service"        "$(systemctl --user is-enabled mwb.service 2>/dev/null)"
+printf '  %-24s %s\n' "/dev/uinput"    "$(ls -l /dev/uinput 2>/dev/null || echo missing)"
+printf '  %-24s %s\n' "in input group" "$(id -nG | tr ' ' '\n' | grep -qx input && echo yes || echo 'NO — reboot needed')"
 
-[Install]
-WantedBy=default.target
+cat <<'EOF'
+
+Next
+  1. Edit the config: host, key, name. Then check the key matches Windows:
+         mwb hash
+     Its "magic: a,b,c" line must equal the one PowerToys logs at startup, in
+     %LOCALAPPDATA%\Microsoft\PowerToys\MouseWithoutBorders\Logs
+
+  2. On Windows: add this machine's name to the MWB machine matrix, and map its
+     IP under "IP address mapping" (Name2IP). Make sure the network holding that
+     IP is classified Private — a Public profile silently drops 15100/15101.
+
+  3. REBOOT if you were just added to the 'input' group, or if the service
+     cannot open /dev/uinput. The systemd --user manager fixes its supplementary
+     groups at login and cannot pick up a new one afterwards, so a re-login or
+     reboot is the only way. Everything else applies immediately.
+
+  4. Then:
+         systemctl --user status mwb
+         journalctl --user -u mwb -f
+         ./scripts/check-peer.sh        # diagnose connectivity
+
+Full guide, with every pitfall we hit: SETUP.md
 EOF
-echo "  Systemd user service installed."
-
-echo ""
-echo "=== Installation Complete ==="
-echo ""
-echo "Next steps:"
-echo "  1. Edit ~/.config/mwb/config.toml with your Windows IP and security key"
-echo "  2. Log out and back in (for group changes)"
-echo "  3. Run receive-only: mwb"
-echo "  4. Optional bidirectional mode: mwb -bidi -edge left"
-echo "  5. Or enable receive-only autostart: systemctl --user enable --now mwb"
-echo ""
