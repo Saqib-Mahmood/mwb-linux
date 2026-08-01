@@ -98,6 +98,19 @@ type Config struct {
 	// pulled into it by the network layer.
 	HeartbeatSeconds int `toml:"heartbeat_seconds"`
 
+	// SwitchEntryPx is how far inside the remote screen the cursor lands after a
+	// switch, in remote pixels. MWB itself uses 2 (JUMP_PIXELS,
+	// Core/MachineStuff.cs:34); a large value is what makes a switch look like a
+	// jump rather than a continuous crossing. Must exceed 1 to clear the peer's
+	// own edge trigger. 0 = default (8).
+	SwitchEntryPx int `toml:"switch_entry_px"`
+
+	// SwitchGraceMs is how long local input is dropped immediately after a
+	// switch, to swallow physical momentum that was already in flight. MWB has
+	// no equivalent and forwards input straight away, so anything large here is
+	// felt as a dead zone. 0 = default (15). Set to -1 for no suppression.
+	SwitchGraceMs int `toml:"switch_grace_ms"`
+
 	// Bidirectional enables sending local input to the remote, i.e. driving
 	// Windows from this machine's keyboard and mouse. Off by default because it
 	// takes an exclusive grab (EVIOCGRAB) of the real input devices whenever
@@ -328,6 +341,27 @@ func (c *Config) ClipboardPort() int {
 
 // ClipboardEnabled reports whether clipboard sharing should run. An absent
 // clipboard key keeps it enabled, preserving the prior default behavior.
+// SwitchEntry reports how far inside the remote screen to land after a switch.
+func (c *Config) SwitchEntry() int {
+	if c.SwitchEntryPx > 1 {
+		return c.SwitchEntryPx
+	}
+	return 8
+}
+
+// SwitchGrace reports how long to drop local input after a switch. A negative
+// configured value means no suppression at all.
+func (c *Config) SwitchGrace() time.Duration {
+	switch {
+	case c.SwitchGraceMs < 0:
+		return 0
+	case c.SwitchGraceMs == 0:
+		return 15 * time.Millisecond
+	default:
+		return time.Duration(c.SwitchGraceMs) * time.Millisecond
+	}
+}
+
 // BidirectionalEnabled reports whether local input should be forwarded to the
 // remote. Unset means disabled — the safe default, since enabling it grabs the
 // real input devices.

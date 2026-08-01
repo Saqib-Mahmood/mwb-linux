@@ -467,6 +467,9 @@ Work top-down; each row is cheaper to check than the one below.
 | Nothing at all, port scan shows **dropped** | Firewall. Dropped ≠ refused — see below. |
 | Nothing at all, port scan shows **refused** | Reachable, nothing listening: MWB isn't running on Windows. |
 | Cursor won't cross the edge | Wrong `edge` value, or `bidirectional` not set. |
+| Cursor **jumps** rather than crossing smoothly | `switch_entry_px` too large. MWB lands 2px inside the edge; the inherited default here was 200px. Try `2`. |
+| Noticeable **pause** just after a switch | `switch_grace_ms`. MWB suppresses no input at all; try `-1`. Remaining latency is the 10ms edge-detection poll, which is inherent to the xdotool-based detection. |
+| Cursor **bounces back** immediately after crossing | `switch_entry_px` too small — it must clear the peer's 1px trigger (`SKIP_PIXELS`). Raise it. |
 | Numpad arrows type digits | Extended-flag mapping; check the arriving keycode with `xev`. |
 | Modifier stuck down after a switch | Report it — the release paths are implemented but lightly tested on real hardware. |
 
@@ -535,6 +538,8 @@ Fix: **reboot**, or `loginctl terminate-user "$USER"` (logs you out).
 | `keyboard_layout` | `"auto"` | Inbound VK→evdev mapping. `us`, `de`, `fr`, `be`, `es`, `it`, `gb`, `pt`, nordic, `ch`, `nl`. |
 | `accel_multiplier` | `2.0` | Scales Linux→Windows motion. `1.0` is the faithful value. |
 | `inbound_multiplier` | `1.0` | Scales Windows→Linux motion. |
+| `switch_entry_px` | `8` | How far inside the remote screen the cursor lands after a switch. MWB uses 2. Larger = visible jump. Must be > 1. |
+| `switch_grace_ms` | `15` | Local input dropped right after a switch. MWB drops none; large values feel like a dead zone. `-1` disables. |
 | `heartbeat_seconds` | `60` | Presence beat. Clamped 60–3600, as PowerToys clamps its own. |
 | `pbkdf2_iterations` | `50000` | **Must match the Windows build.** 50000 up to `3bf6820`; 100000 on newer `main`. |
 | `machine_id` | `0` | `0` = persist one in `$XDG_STATE_HOME/mwb/machine_id`. `0` and `255` are reserved. |

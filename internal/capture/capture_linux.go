@@ -46,11 +46,30 @@ const (
 	// 2px jump plus rounding, but narrow enough to reject the opposite far edge.
 	reclaimEdgeMargin = 8192
 
-	// remoteReturnMargin is in remote-screen pixels, not 0-65535 wire units.
-	// It must be smaller than the 200px remote entry offset, otherwise a
-	// MachineSwitched notification at the entry position can bounce straight
-	// back before the cursor reaches the real shared edge.
-	remoteReturnMargin = 64
+	// defaultSwitchEntryPx is how far inside the remote screen the cursor lands
+	// after a switch, in remote-screen pixels.
+	//
+	// MWB itself uses JUMP_PIXELS = 2 (Core/MachineStuff.cs:34), which is why a
+	// Windows-to-Windows switch looks continuous: the cursor reappears 2px past
+	// the edge. Entering at exactly 0 would re-trigger the peer's own edge test
+	// (SKIP_PIXELS = 1, Core/MachineStuff.cs:33) and bounce straight back, so a
+	// small offset is required — but it only has to clear 1px.
+	//
+	// This was 200px, which is a visible jump and the main reason a switch felt
+	// discontinuous compared with Windows-to-Windows. 8px clears the peer's 1px
+	// trigger with room for rounding through the 0..65535 wire mapping while
+	// staying imperceptible.
+	defaultSwitchEntryPx = 8
+
+	// defaultSwitchGrace is how long local input is dropped after a switch.
+	//
+	// MWB has no equivalent: Event.PrepareToSwitchToMachine sets the new target
+	// and input flows immediately, with lastJump (100ms) rate-limiting further
+	// *switches* rather than suppressing input. This was 100ms, which is a
+	// clearly perceptible dead zone right when you expect the remote cursor to
+	// start moving. Keep just enough to swallow the physical momentum that was
+	// already in flight when the edge was crossed.
+	defaultSwitchGrace = 15 * time.Millisecond
 )
 
 type inputEvent struct {
@@ -91,6 +110,11 @@ type Capturer struct {
 	accelMult     float64                   // scaling applied to raw evdev deltas (config: accel_multiplier)
 	edgeY         int32                     // Y position where cursor left local screen
 	canSwitch     bool                      // true once cursor has been away from edge since activation
+	// switchEntryPx is how far inside the remote screen we land after a switch,
+	// and switchGrace how long local input is dropped afterwards. Both are
+	// perceptual knobs; see the defaults for why they matter. Guarded by mu.
+	switchEntryPx int32
+	switchGrace   time.Duration
 	// remoteKeysDown maps a Windows VK we have pressed on the remote (and not
 	// released) to the LLKHF flags it was sent with. Guarded by mu.
 	remoteKeysDown map[int32]int32
@@ -114,15 +138,17 @@ type trackedDevice struct {
 // descriptors, and the kernel dropped them when those descriptors closed.
 func New(conn *network.Conn, screen ScreenInfo, edgeSide string) *Capturer {
 	return &Capturer{
-		conn:      conn,
-		screen:    screen,
-		active:    true,
-		edgeSide:  edgeSide,
-		stopCh:    make(chan struct{}),
-		remoteW:   defaultRemoteWidth,
-		remoteH:   defaultRemoteHeight,
-		accelMult: defaultAccelMultiplier,
-		canSwitch: true, // allow first switch immediately
+		conn:          conn,
+		screen:        screen,
+		active:        true,
+		edgeSide:      edgeSide,
+		stopCh:        make(chan struct{}),
+		remoteW:       defaultRemoteWidth,
+		remoteH:       defaultRemoteHeight,
+		accelMult:     defaultAccelMultiplier,
+		switchEntryPx: defaultSwitchEntryPx,
+		switchGrace:   defaultSwitchGrace,
+		canSwitch:     true, // allow first switch immediately
 	}
 }
 
@@ -217,9 +243,9 @@ func (c *Capturer) AcceptsActivation() bool {
 
 	switch c.edgeSide {
 	case "left":
-		return c.remoteX >= remoteW-remoteReturnMargin
+		return c.remoteX >= remoteW-c.returnMargin()
 	case "right":
-		return c.remoteX <= remoteReturnMargin
+		return c.remoteX <= c.returnMargin()
 	default:
 		return true
 	}
@@ -242,6 +268,37 @@ func (c *Capturer) SetRemoteScreen(w, h int32) {
 		c.remoteH = h
 		slog.Info("remote screen dimensions updated", "width", w, "height", h)
 	}
+}
+
+// SetSwitchFeel tunes how a switch looks and feels. entryPx is how far inside
+// the remote screen the cursor lands; grace is how long local input is dropped
+// afterwards. Non-positive values keep the current setting.
+//
+// entryPx must stay above the peer's own 1px edge trigger
+// (SKIP_PIXELS, Core/MachineStuff.cs:33) or the cursor bounces back, and the
+// return margin is derived from it so the two cannot disagree.
+func (c *Capturer) SetSwitchFeel(entryPx int, grace time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entryPx > 1 {
+		c.switchEntryPx = int32(entryPx)
+	}
+	if grace >= 0 {
+		c.switchGrace = grace
+	}
+}
+
+// returnMargin is how close to the return edge an inbound MachineSwitched is
+// accepted from, and how far the cursor must travel inward before a return is
+// armed. Derived from the entry offset rather than fixed, because a margin
+// larger than the entry offset means we land already inside the return zone and
+// a MachineSwitched can bounce control straight back. Caller holds mu.
+func (c *Capturer) returnMargin() int32 {
+	m := c.switchEntryPx / 2
+	if m < 1 {
+		m = 1
+	}
+	return m
 }
 
 // SetAccelMultiplier sets the scaling applied to raw evdev deltas before they
@@ -479,26 +536,40 @@ func (c *Capturer) pollCursorEdge() {
 
 				// Map local Y to remote entry point (proportional)
 				entryY := int32(float64(y) / float64(c.screen.Height) * 65535)
-				// Enter 200px inside the remote screen, not at the literal edge.
-				// Entering at exactly 0 or 65535 triggers Windows MWB's own edge
-				// detection immediately, bouncing the cursor straight back.
-				// 200px margin ≈ 200/1920 * 65535 ≈ 6826 units from the edge.
-				const edgeMargin = int32(6826)
-				entryX := edgeMargin // enter from left of remote, slightly inside
+
+				// Land just inside the remote edge, not at it: entering at
+				// exactly 0 or 65535 re-triggers the peer's own edge test
+				// (SKIP_PIXELS = 1, Core/MachineStuff.cs:33) and bounces us
+				// back. MWB's own entry offset is 2px (JUMP_PIXELS), which is
+				// why a Windows-to-Windows switch looks seamless — so convert a
+				// small pixel offset into wire units rather than using a fixed
+				// large constant.
+				c.mu.Lock()
+				entryPx := c.switchEntryPx
+				remoteW := c.remoteW
+				c.mu.Unlock()
+				if remoteW <= 0 {
+					remoteW = defaultRemoteWidth
+				}
+				edgeMargin := entryPx * 65535 / remoteW
+				if edgeMargin < 1 {
+					edgeMargin = 1
+				}
+				entryX := edgeMargin // enter just inside the remote's left edge
 				if c.edgeSide == "left" {
-					entryX = 65535 - edgeMargin // enter from right of remote, slightly inside
+					entryX = 65535 - edgeMargin // ... or just inside its right edge
 				}
 
 				c.mu.Lock()
 				c.active = false
 				c.switchSent = time.Now()
 				c.edgeY = y
-				// Set virtual cursor offset from the return edge to prevent jitter bounce.
-				// Entry is 200px from the return edge — gives room for mouse momentum.
+				// Seed the virtual cursor at the same place the remote will put
+				// the real one, so our return test tracks reality.
 				if c.edgeSide == "left" {
-					c.remoteX = c.remoteW - 200
+					c.remoteX = c.remoteW - entryPx
 				} else {
-					c.remoteX = 200
+					c.remoteX = entryPx
 				}
 				c.remoteY = int32(float64(y) / float64(c.screen.Height) * float64(c.remoteH))
 				c.canReturn = false // must move away from return edge first
@@ -796,7 +867,7 @@ func (c *Capturer) handleEvent(ev inputEvent) {
 	}
 	// Suppress during switch grace period
 	c.mu.Lock()
-	grace := !c.switchSent.IsZero() && time.Since(c.switchSent) < 100*time.Millisecond
+	grace := !c.switchSent.IsZero() && time.Since(c.switchSent) < c.switchGrace
 	c.mu.Unlock()
 	if grace {
 		return
@@ -853,9 +924,14 @@ func (c *Capturer) handleRel(ev inputEvent) {
 		return
 	}
 
-	// canReturn gate: must move 200px away from return edge before allowing return.
-	// This prevents jitter/momentum from the initial switch from bouncing back.
-	returnZone := int32(200)
+	// canReturn gate: the cursor must travel inward before a return is allowed,
+	// so momentum left over from the switch cannot bounce it straight back. This
+	// gate — not a large entry offset — is what actually prevents the bounce,
+	// which is why the entry offset can be small enough to look continuous.
+	returnZone := c.returnMargin()
+	if returnZone < 32 {
+		returnZone = 32 // enough to outlast physical momentum
+	}
 	switch c.edgeSide {
 	case "left":
 		if c.remoteX < c.remoteW-returnZone {

@@ -483,3 +483,61 @@ key = "AAAABBBBCCCCDDDD"
 		t.Fatalf("an ordinary key must be accepted: %v", err)
 	}
 }
+
+// The switch-feel knobs exist because the inherited defaults made a switch look
+// and feel unlike a Windows-to-Windows one: a 200px entry offset is a visible
+// jump (MWB uses 2px, Core/MachineStuff.cs:34) and 100ms of input suppression is
+// a perceptible dead zone (MWB suppresses nothing).
+func TestSwitchFeelDefaults(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+host = "10.0.0.1"
+key = "AAAABBBBCCCCDDDD"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.SwitchEntry(); got != 8 {
+		t.Errorf("default entry offset = %d, want 8", got)
+	}
+	if got := cfg.SwitchGrace(); got != 15*time.Millisecond {
+		t.Errorf("default grace = %v, want 15ms", got)
+	}
+}
+
+func TestSwitchFeelOverrides(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+host = "10.0.0.1"
+key = "AAAABBBBCCCCDDDD"
+switch_entry_px = 2
+switch_grace_ms = 40
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.SwitchEntry(); got != 2 {
+		t.Errorf("entry offset = %d, want 2", got)
+	}
+	if got := cfg.SwitchGrace(); got != 40*time.Millisecond {
+		t.Errorf("grace = %v, want 40ms", got)
+	}
+}
+
+// 0 or 1 would put the cursor inside the peer's own 1px edge trigger
+// (SKIP_PIXELS, Core/MachineStuff.cs:33) and bounce it straight back, so those
+// fall back to the default rather than being honoured.
+func TestSwitchEntryRejectsBounceProneValues(t *testing.T) {
+	for _, v := range []int{0, 1, -5} {
+		cfg := &Config{SwitchEntryPx: v}
+		if got := cfg.SwitchEntry(); got != 8 {
+			t.Errorf("switch_entry_px = %d resolved to %d, want the 8px default", v, got)
+		}
+	}
+}
+
+// A negative grace means "suppress nothing", which is closest to MWB.
+func TestSwitchGraceCanBeDisabled(t *testing.T) {
+	cfg := &Config{SwitchGraceMs: -1}
+	if got := cfg.SwitchGrace(); got != 0 {
+		t.Errorf("switch_grace_ms = -1 resolved to %v, want 0", got)
+	}
+}

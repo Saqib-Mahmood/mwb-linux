@@ -37,3 +37,16 @@ name = "linux"                # must also appear in the Windows machine matrix
 # $XDG_STATE_HOME/mwb/machine_id. 0 = persist automatically. Must not be 0 or
 # 255, which are reserved (ID.NONE and ID.ALL).
 # machine_id = 0
+
+# ── Switch feel ───────────────────────────────────────────────────────────────
+# How far inside the remote screen the cursor lands after a switch, in remote
+# pixels. MWB itself uses 2 (JUMP_PIXELS); the inherited default here was 200,
+# which is a visible jump and the main reason a switch felt discontinuous
+# compared with Windows-to-Windows. Must be > 1 to clear the peer's own 1px edge
+# trigger, or the cursor bounces straight back.
+# switch_entry_px = 8
+
+# How long local input is dropped right after a switch, to swallow physical
+# momentum already in flight. MWB suppresses nothing, so anything large is felt
+# as a dead zone; the inherited default here was 100ms. -1 disables it entirely.
+# switch_grace_ms = 15

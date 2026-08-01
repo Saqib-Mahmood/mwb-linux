@@ -357,6 +357,8 @@ func main() {
 				// Cursor speed: the only acceleration knob lives here (Windows
 				// applies none of its own), so honor the configured multiplier.
 				cap.SetAccelMultiplier(cfg.AccelMultiplier)
+				// How continuous a switch looks and how quickly it responds.
+				cap.SetSwitchFeel(cfg.SwitchEntry(), cfg.SwitchGrace())
 				handler.ShouldReclaim = func(requestX, _ int32, _ int32) bool {
 					return cap.AcceptsReclaim(requestX)
 				}
