@@ -91,9 +91,12 @@ type Capturer struct {
 	accelMult     float64                   // scaling applied to raw evdev deltas (config: accel_multiplier)
 	edgeY         int32                     // Y position where cursor left local screen
 	canSwitch     bool                      // true once cursor has been away from edge since activation
-	canReturn     bool                      // true once cursor has moved away from the remote return edge
-	hotkeyCtrl    bool                      // tracks Ctrl key state for hotkey detection
-	hotkeyAlt     bool                      // tracks Alt key state for hotkey detection
+	// remoteKeysDown maps a Windows VK we have pressed on the remote (and not
+	// released) to the LLKHF flags it was sent with. Guarded by mu.
+	remoteKeysDown map[int32]int32
+	canReturn      bool // true once cursor has moved away from the remote return edge
+	hotkeyCtrl     bool // tracks Ctrl key state for hotkey detection
+	hotkeyAlt      bool // tracks Alt key state for hotkey detection
 	// OnActivated runs whenever this capturer transitions from remote control
 	// back to local ownership, including its own virtual-edge return path.
 	OnActivated func()
@@ -143,6 +146,10 @@ func (c *Capturer) SetActive(active bool) {
 	// applyIsolation acquires c.mu internally — must be called after unlock.
 	// Calling it under the lock caused a deadlock that froze all goroutines.
 	if shouldEnable {
+		// Same reasoning as the virtual-edge return in pollCursorEdge: control
+		// is coming back to us, so release whatever we left held on the remote
+		// before we stop forwarding its key-ups.
+		c.releaseRemoteKeys()
 		c.applyIsolation()
 		if onActivated != nil {
 			onActivated()
@@ -892,6 +899,11 @@ func (c *Capturer) handleRel(ev inputEvent) {
 		c.canSwitch = false // block re-trigger until cursor moves away from edge
 		c.mu.Unlock()
 
+		// Let go of anything we are still holding down on the remote, before we
+		// stop forwarding. The user may well be mid-chord; the physical key-up
+		// is about to land locally instead, so the remote would never hear it.
+		c.releaseRemoteKeys()
+
 		// Move cursor away from edge SYNCHRONOUSLY before releasing the grab.
 		// Ordering is load-bearing: release first and in-flight physical mouse
 		// motion drives the cursor straight back into the edge, bouncing the
@@ -992,7 +1004,11 @@ func (c *Capturer) handleKey(ev inputEvent) {
 		return
 	}
 
-	vk, ok := input.KeyCodeToVK(ev.Code)
+	// keyFlags carries LLKHF_EXTENDED for keys whose Windows scancode is
+	// E0-prefixed — numpad Enter, the right-hand modifiers, the dedicated
+	// navigation cluster. Without it a Windows target sees lParam bit 24 clear,
+	// so numpad Enter arrives as main Enter and right Ctrl as left Ctrl.
+	vk, keyFlags, ok := input.KeyCodeToVKFlags(ev.Code)
 	if !ok {
 		return
 	}
@@ -1001,9 +1017,9 @@ func (c *Capturer) handleKey(ev inputEvent) {
 	// keydowns — an injected key does not auto-repeat on Windows, so a held key
 	// only repeats if we resend the press (mirrors MWB's own keyboard hook,
 	// which emits a WM_KEYDOWN per hardware repeat).
-	var dwFlags int32
+	dwFlags := keyFlags
 	if ev.Value == 0 {
-		dwFlags = protocol.LLKHF_UP
+		dwFlags |= protocol.LLKHF_UP
 	}
 
 	pkt := &protocol.Packet{
@@ -1014,8 +1030,76 @@ func (c *Capturer) handleKey(ev inputEvent) {
 	pkt.Keyboard.WVk = vk
 	pkt.Keyboard.DwFlags = dwFlags
 
+	// Remember what we have pressed but not released, so switching back can let
+	// go of it on the remote side. See releaseRemoteKeys.
+	c.mu.Lock()
+	if ev.Value == 0 {
+		delete(c.remoteKeysDown, vk)
+	} else {
+		if c.remoteKeysDown == nil {
+			c.remoteKeysDown = make(map[int32]int32, 8)
+		}
+		c.remoteKeysDown[vk] = keyFlags
+	}
+	c.mu.Unlock()
+
 	if err := c.conn.SendPacket(pkt); err != nil {
 		slog.Debug("send keyboard failed", "err", err)
+	}
+}
+
+// releaseRemoteKeys sends a key-up for everything we pressed on the remote and
+// never released, then tells it to drop its own held modifiers.
+//
+// Control returns to Linux the moment the virtual cursor crosses the far edge,
+// which can easily happen with a modifier held. The physical key-up then lands
+// on the Linux side after the grab is released, so the Windows peer never hears
+// about it and the modifier stays logically down over there — every subsequent
+// keystroke on Windows is modified until the user presses and releases that key
+// again. PowerToys avoids this by calling ReleaseAllKeys on a switch
+// (Core/InitAndCleanup.cs:213-244) and by sending HideMouse to the machine
+// losing control (Core/Event.cs:212-215).
+//
+// Must be called with c.mu NOT held.
+func (c *Capturer) releaseRemoteKeys() {
+	c.mu.Lock()
+	held := make(map[int32]int32, len(c.remoteKeysDown))
+	for vk, flags := range c.remoteKeysDown {
+		held[vk] = flags
+	}
+	c.remoteKeysDown = nil
+	conn := c.conn
+	c.mu.Unlock()
+
+	if conn == nil {
+		return
+	}
+	if len(held) > 0 {
+		slog.Debug("releasing keys held on the remote at switch-back", "count", len(held))
+	}
+	for vk, flags := range held {
+		pkt := &protocol.Packet{
+			Type: protocol.Keyboard,
+			Src:  conn.MachineID,
+			Des:  conn.RemoteID,
+		}
+		pkt.Keyboard.WVk = vk
+		pkt.Keyboard.DwFlags = flags | protocol.LLKHF_UP
+		if err := conn.SendPacket(pkt); err != nil {
+			slog.Debug("releasing remote key failed", "vk", vk, "err", err)
+		}
+	}
+
+	// HideMouse tells the peer that it is losing control, which makes its own
+	// receiver release anything it still believes is held
+	// (Core/Receiver.cs:383-388).
+	hide := &protocol.Packet{
+		Type: protocol.HideMouse,
+		Src:  conn.MachineID,
+		Des:  conn.RemoteID,
+	}
+	if err := conn.SendPacket(hide); err != nil {
+		slog.Debug("sending HideMouse on switch-back failed", "err", err)
 	}
 }
 

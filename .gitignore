@@ -31,3 +31,7 @@ graphify-out/
 
 # goreleaser build output
 dist/
+
+# Python bytecode from tools/
+__pycache__/
+*.pyc

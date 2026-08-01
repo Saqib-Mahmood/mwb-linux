@@ -112,8 +112,14 @@ const (
 	KEY_LEFTMETA   uint16 = 125
 	KEY_RIGHTMETA  uint16 = 126
 	KEY_COMPOSE    uint16 = 127
-	KEY_102ND      uint16 = 86
-	KEY_MAX        uint16 = 0x2ff
+	// Consumer-control keys. Verified on this machine via xmodmap -pke
+	// (X keycode == evdev code + 8): 171/172/173/174 -> 163/164/165/166.
+	KEY_NEXTSONG     uint16 = 163
+	KEY_PLAYPAUSE    uint16 = 164
+	KEY_PREVIOUSSONG uint16 = 165
+	KEY_STOPCD       uint16 = 166
+	KEY_102ND        uint16 = 86
+	KEY_MAX          uint16 = 0x2ff
 )
 
 const (
@@ -138,9 +144,35 @@ const (
 	vkOEM102   int32 = 0xE2
 )
 
-// vkMap maps Windows VK codes to Linux evdev KEY_ codes.
+// vkMap maps Windows VK codes to Linux evdev KEY_ codes. This is the
+// non-extended (no E0 scancode prefix) form of every key; see extendedVKMap for
+// the LLKHF_EXTENDED variants.
+//
+// The navigation entries below (0x0D->KEY_ENTER, 0x21/0x22 page, 0x23/0x24
+// end/home, 0x25-0x28 arrows, 0x2D/0x2E ins/del) deliberately stay on the
+// dedicated nav cluster even though the scancode-faithful non-extended form of
+// those VKs is the numpad key. Do not "fix" this: Windows SendKey injects a bare
+// VK without KEYEVENTF_SCANCODE (Class/InputSimulation.cs:137-140), so a
+// non-extended VK_LEFT moves the caret there and can never type "4". Linux
+// injection is by evdev keycode, which does pass through the seat's XKB NumLock
+// state, so mapping plain VK_LEFT->KEY_KP4 would type "4" whenever local NumLock
+// happened to be on. Plain->nav is what reproduces Windows->Windows behaviour in
+// both NumLock states.
 var vkMap = map[int32]uint16{
+	// 0x0C VK_CLEAR is deliberately absent. It is what Windows sends for numpad
+	// 5 with NumLock off, and mapping it to KEY_KP5 would be the exact mistake
+	// the comment above warns against: Linux injects an evdev keycode, so with
+	// the local NumLock on it would type "5" — whereas Windows-to-Windows
+	// injects VK_CLEAR by virtual key and types nothing. Core/VK.cs does not
+	// declare VK_CLEAR either. Dropping it matches the Windows behaviour.
 	0x08: KEY_BACKSPACE, 0x09: KEY_TAB, 0x0D: KEY_ENTER,
+	// Generic modifier VKs. MWB itself injects these: GetVkCodesList builds hotkey
+	// replays out of VK.SHIFT/MENU/CONTROL (Class/InputHook.cs:485-511) and
+	// ReleaseAllKeys sends them as key-ups (Core/InitAndCleanup.cs:225-241). The
+	// receiver passes wVk straight to SendInput, where the non-extended scancode of
+	// each resolves to the left-hand key, so mirror that; without these entries a
+	// stuck-modifier release would be dropped on the floor.
+	0x10: KEY_LEFTSHIFT, 0x11: KEY_LEFTCTRL, 0x12: KEY_LEFTALT,
 	0x13: KEY_PAUSE, 0x14: KEY_CAPSLOCK, 0x1B: KEY_ESC, 0x20: KEY_SPACE,
 	0x21: KEY_PAGEUP, 0x22: KEY_PAGEDOWN, 0x23: KEY_END, 0x24: KEY_HOME,
 	0x25: KEY_LEFT, 0x26: KEY_UP, 0x27: KEY_RIGHT, 0x28: KEY_DOWN,
@@ -159,11 +191,46 @@ var vkMap = map[int32]uint16{
 	0xA2: KEY_LEFTCTRL, 0xA3: KEY_RIGHTCTRL,
 	0xA4: KEY_LEFTALT, 0xA5: KEY_RIGHTALT,
 	0xAD: KEY_MUTE, 0xAE: KEY_VOLUMEDOWN, 0xAF: KEY_VOLUMEUP,
+	// VK numbers per Core/VK.cs:76-79.
+	0xB0: KEY_NEXTSONG, 0xB1: KEY_PREVIOUSSONG,
+	0xB2: KEY_STOPCD, 0xB3: KEY_PLAYPAUSE,
 	vkOEM1: KEY_SEMICOLON, vkOEMPlus: KEY_EQUAL, vkOEMComma: KEY_COMMA,
 	vkOEMMinus: KEY_MINUS, vkOEMDot: KEY_DOT, vkOEM2: KEY_SLASH,
 	vkOEM3: KEY_GRAVE, vkOEM4: KEY_LEFTBRACE, vkOEM5: KEY_BACKSLASH,
 	vkOEM6: KEY_RIGHTBRACE, vkOEM7: KEY_APOSTROPHE,
 	vkOEM102: KEY_102ND, // common on ISO keyboards (< > |)
+}
+
+// extendedVKMap holds the VK -> evdev mapping that applies when the sender set
+// LLKHF_EXTENDED (0x01) in KEYBDDATA.dwFlags, i.e. the key's scancode carried the
+// E0 prefix. The receiver looks at exactly two bits of dwFlags, 0x80 (UP) and
+// 0x01 (EXTENDED), and masks rather than compares because dwFlags is a full int32
+// on the wire (Class/InputSimulation.cs:115-123).
+//
+// The extended bit is the only thing that separates the numpad cluster from the
+// dedicated nav cluster, right Ctrl/Alt from left, and numpad Enter from main
+// Enter, so these VKs need two mappings each.
+var extendedVKMap = map[int32]uint16{
+	0x0D: KEY_KPENTER,   // VK_RETURN:  plain -> KEY_ENTER,    E0 -> numpad Enter
+	0x11: KEY_RIGHTCTRL, // VK_CONTROL: plain -> KEY_LEFTCTRL, E0 -> right Ctrl
+	0x12: KEY_RIGHTALT,  // VK_MENU:    plain -> KEY_LEFTALT,  E0 -> right Alt / AltGr
+	// The generic 0x11/0x12/0x10 VKs only reach us from MWB's synthetic hotkey
+	// replay; the hook forwards the raw KBDLLHOOKSTRUCT, so real modifier presses
+	// arrive as the side-specific 0xA0-0xA5 (Class/InputHook.cs:348-349).
+	0x21: KEY_PAGEUP, 0x22: KEY_PAGEDOWN, 0x23: KEY_END, 0x24: KEY_HOME,
+	0x25: KEY_LEFT, 0x26: KEY_UP, 0x27: KEY_RIGHT, 0x28: KEY_DOWN,
+	0x2D: KEY_INSERT, 0x2E: KEY_DELETE,
+	// Always-extended keys. Same target as vkMap either way; listed so the E0 rule
+	// is documented in one place and so the reverse direction knows to set the bit.
+	0x2C: KEY_SYSRQ, 0x6F: KEY_KPSLASH, 0x90: KEY_NUMLOCK,
+	0x5B: KEY_LEFTMETA, 0x5C: KEY_RIGHTMETA, 0x5D: KEY_COMPOSE,
+	0xA3: KEY_RIGHTCTRL, 0xA5: KEY_RIGHTALT,
+	0xAD: KEY_MUTE, 0xAE: KEY_VOLUMEDOWN, 0xAF: KEY_VOLUMEUP,
+	0xB0: KEY_NEXTSONG, 0xB1: KEY_PREVIOUSSONG,
+	0xB2: KEY_STOPCD, 0xB3: KEY_PLAYPAUSE,
+	// Absent on purpose: 0x10 VK_SHIFT (neither Shift is E0-prefixed, and the
+	// low-level hook reports 0xA0/0xA1 anyway), 0x13 VK_PAUSE (E1-prefixed, not
+	// E0) and 0x60-0x6E (numpad with NumLock on is never extended).
 }
 
 var layoutVKOverrides = map[string]map[int32]uint16{
@@ -282,6 +349,21 @@ func VKToKeyCodeForLayout(vk int32, layout string) (uint16, bool) {
 	return VKToKeyCode(vk)
 }
 
+// VKToKeyCodeExtended resolves a VK the way the Windows receiver does: the E0
+// (LLKHF_EXTENDED) form of a VK is a different physical key, so consult
+// extendedVKMap first and only then fall back to the layout-aware plain mapping.
+// Callers must pass extended as (kd.dwFlags & LLKHF_EXTENDED) != 0, never an
+// equality test — dwFlags also carries UP and injected/altdown bits
+// (Class/InputSimulation.cs:115-123).
+func VKToKeyCodeExtended(vk int32, extended bool, layout string) (uint16, bool) {
+	if extended {
+		if code, ok := extendedVKMap[vk]; ok {
+			return code, true
+		}
+	}
+	return VKToKeyCodeForLayout(vk, layout)
+}
+
 func normalizedLayoutOverrides(layout string) (map[int32]uint16, bool) {
 	profile := CanonicalKeyboardLayout(layout)
 	overrides, ok := layoutVKOverrides[profile]
@@ -289,12 +371,19 @@ func normalizedLayoutOverrides(layout string) (map[int32]uint16, bool) {
 }
 
 // usedKeyCodes returns a deduplicated sorted list of all Linux evdev key codes
-// referenced by vkMap. Used by CreateVirtualKeyboard to register only the bits
-// it needs — avoids 640+ unnecessary UI_SET_KEYBIT ioctl calls (KEY_MAX=767
-// vs actual max used code of ~127).
+// referenced by vkMap or extendedVKMap. Used by CreateVirtualKeyboard to register
+// only the bits it needs — avoids 600+ unnecessary UI_SET_KEYBIT ioctl calls
+// (KEY_MAX=767 vs actual max used code of 166).
+//
+// extendedVKMap must be included: the kernel silently drops EV_KEY for codes that
+// were never registered with UI_SET_KEYBIT, so leaving out e.g. KEY_KPENTER (96)
+// would make numpad Enter a no-op even though the mapping resolves.
 func usedKeyCodes() []uint16 {
-	seen := make(map[uint16]struct{}, len(vkMap))
+	seen := make(map[uint16]struct{}, len(vkMap)+len(extendedVKMap))
 	for _, code := range vkMap {
+		seen[code] = struct{}{}
+	}
+	for _, code := range extendedVKMap {
 		seen[code] = struct{}{}
 	}
 	codes := make([]uint16, 0, len(seen))

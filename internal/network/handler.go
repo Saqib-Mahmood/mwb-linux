@@ -59,6 +59,11 @@ type Handler struct {
 	inX, inY         int32 // current injected absolute position (0-65535)
 	lastInX, lastInY int32 // last absolute position reported by the remote
 	inSeeded         bool  // false until the first inbound move seeds the tracker
+
+	// keysDown tracks every keycode we have injected a press for and not yet a
+	// release, so control leaving us can let go of them. Same goroutine as the
+	// rest of the receive path, so no lock.
+	keysDown map[uint16]bool
 }
 
 // HandlePacket dispatches a packet to the appropriate handler.
@@ -89,7 +94,11 @@ func (h *Handler) HandlePacket(pkt *protocol.Packet) {
 			h.OnActivated()
 		}
 	case protocol.HideMouse:
+		// Control is leaving us, so we will never be sent the key-ups for
+		// anything currently held. Release them now, exactly as the C# receiver
+		// does (Core/Receiver.cs:383-388 -> InitAndCleanup.ReleaseAllKeys).
 		slog.Debug("HideMouse received — cursor leaving us", "src", pkt.Src)
+		h.releaseHeldKeys()
 	case protocol.NextMachine:
 		if h.ShouldReclaim != nil && !h.ShouldReclaim(pkt.Mouse.X, pkt.Mouse.Y, pkt.Mouse.WheelDelta) {
 			slog.Debug("NextMachine ignored — requested landing point is not on our shared edge",
@@ -255,13 +264,47 @@ func (h *Handler) handleKeyboard(pkt *protocol.Packet) {
 	var err error
 	if isUp {
 		err = h.Keyboard.KeyUp(keyCode)
+		delete(h.keysDown, keyCode)
 	} else {
 		err = h.Keyboard.KeyDown(keyCode)
+		if h.keysDown == nil {
+			h.keysDown = make(map[uint16]bool, 8)
+		}
+		h.keysDown[keyCode] = true
 	}
 	if err != nil {
 		slog.Error("keyboard input error", "err", err)
 	}
 }
+
+// releaseHeldKeys lets go of everything we injected and never released.
+//
+// PowerToys does the same on its side (Core/InitAndCleanup.cs:213-244
+// ReleaseAllKeys, called from the HideMouse handler at Core/Receiver.cs:383-388)
+// because the machine losing control never sees the key-up: the user releases
+// the key while the other machine owns the keyboard. Without this, a Shift or
+// Ctrl held during a switch stays logically down on the Linux desktop and
+// everything typed afterwards is modified — the classic "my keyboard has gone
+// weird" symptom, which survives until the key is pressed and released again.
+//
+// The C# version checks GetAsyncKeyState for what is *physically* down; we
+// release what we *injected*, which is the right analogue for a virtual device.
+func (h *Handler) releaseHeldKeys() {
+	if len(h.keysDown) == 0 {
+		return
+	}
+	slog.Debug("releasing keys held at switch-away", "count", len(h.keysDown))
+	for code := range h.keysDown {
+		if err := h.Keyboard.KeyUp(code); err != nil {
+			slog.Error("releasing held key", "code", code, "err", err)
+		}
+		delete(h.keysDown, code)
+	}
+}
+
+// ReleaseHeldKeys is the exported form, for teardown paths outside the receive
+// loop (connection loss, shutdown).
+func (h *Handler) ReleaseHeldKeys() { h.releaseHeldKeys() }
 
 func (h *Handler) flushPendingCtrl() error {
 	if !h.pendingCtrl {
@@ -271,23 +314,18 @@ func (h *Handler) flushPendingCtrl() error {
 	return h.Keyboard.KeyDown(h.pendingCtrlCode)
 }
 
+// keyCodeForPacket resolves a Windows virtual key to a Linux evdev keycode.
+//
+// The E0/extended rule lives entirely in input.VKToKeyCodeExtended, so this is
+// a single lookup. It used to special-case 0x10/0x11/0x12 here, which shadowed
+// the map and left numpad Enter and the nav/numpad split unhandled.
+//
+// Only two bits of Kd.dwFlags carry meaning — 0x80 = UP (handled by the caller)
+// and 0x01 = EXTENDED (Class/InputSimulation.cs:115-123). dwFlags is a full
+// int32 on the wire, so mask rather than compare.
 func (h *Handler) keyCodeForPacket(kd protocol.KeyboardData) (uint16, bool) {
-	switch kd.WVk {
-	case 0x10:
-		return input.KEY_LEFTSHIFT, true
-	case 0x11:
-		if kd.DwFlags&protocol.LLKHF_EXTENDED != 0 {
-			return input.KEY_RIGHTCTRL, true
-		}
-		return input.KEY_LEFTCTRL, true
-	case 0x12:
-		if kd.DwFlags&protocol.LLKHF_EXTENDED != 0 {
-			return input.KEY_RIGHTALT, true
-		}
-		return input.KEY_LEFTALT, true
-	default:
-		return input.VKToKeyCodeForLayout(kd.WVk, h.KeyboardLayout)
-	}
+	extended := kd.DwFlags&protocol.LLKHF_EXTENDED != 0
+	return input.VKToKeyCodeExtended(kd.WVk, extended, h.KeyboardLayout)
 }
 
 func (h *Handler) handlePendingCtrl(vk, flags int32, keyCode uint16, isUp bool) bool {

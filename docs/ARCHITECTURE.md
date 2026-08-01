@@ -36,9 +36,11 @@ sequenceDiagram
     rect rgb(236, 244, 255)
         note over L,W: 1 · TCP connect + encryption
         L->>W: TCP dial :15101
-        L->>W: 16-byte IV seed
-        W->>L: 16-byte IV seed
-        note over L,W: AES-256-CBC streams up
+        L->>W: salt(16) ‖ IV(16) — CLEARTEXT
+        W->>L: salt(16) ‖ IV(16) — CLEARTEXT
+        note over L,W: each side derives the other's key from the salt it received
+        L->>W: E(primer 16) — discarded
+        W->>L: E(primer 16) — discarded
     end
     rect rgb(240, 255, 240)
         note over L,W: 2 · Handshake
@@ -52,16 +54,51 @@ sequenceDiagram
         note over L,W: 3 · Steady state
         W->>L: Matrix·Hi — request machine layout
         L->>W: Hello — confirm presence
-        loop every 5s
+        loop every 60s
             W->>L: HeartbeatEx (keep-alive)
             L->>W: HeartbeatEx (with machine name)
         end
     end
 ```
 
-**Key derivation**: `PBKDF2(SHA512, securityKey, UTF16LE("18446744073709551615"), 50000 iterations) → 32-byte AES key`
+### Stream crypto
 
-**Fixed IV**: ASCII bytes of `"1844674407370955"` (first 16 chars of uint64.MaxValue)
+Each direction is keyed independently. Per direction, in order:
+
+```
+salt(16) ‖ IV(16)     32 bytes, CLEARTEXT, written on the raw socket
+E(primer 16)          one throwaway block through the cipher, discarded by the reader
+E(frames…)            32- or 64-byte frames
+```
+
+**Key derivation**: `PBKDF2-HMAC-SHA512(securityKey_as_UTF8, salt, 50000, 32)` —
+`Core/Encryption.cs:106-114 GenLegalKey`. The salt is the random one just received
+from the peer for the read direction, and the one we generated for the write
+direction, so **the two directions use different AES keys**.
+
+**Cipher**: AES-256-CBC with `PaddingMode.Zeros` (`Core/Encryption.cs:95`). Zeros
+padding disables .NET's depadding holdback, so plaintext and ciphertext byte
+counts are always equal and a 32-byte frame can be read with no lookahead.
+
+> **This changed.** Before PowerToys PR #48742 (June 2026) the salt was the fixed
+> `UTF16LE("18446744073709551615")` and the IV was the fixed ASCII
+> `"1844674407370955"`, with no cleartext prologue. Upstream `mwb-linux` and
+> `bketelsen/mwb` still implement that scheme and cannot handshake against a
+> current PowerToys build. Current PowerToys `main` has since raised the
+> iteration count to 100,000; `pbkdf2_iterations` in the config selects it.
+
+**Magic number**: `Get24BitHash` (`Core/Encryption.cs:172-199`) — SHA-512 over a
+32-byte buffer holding the low byte of each of the first 32 UTF-16 code units of
+the key, then 50,000 further SHA-512 rounds, then
+`(h[0]<<23) + (h[1]<<16) + (h[63]<<8) + h[2]`. Note the shift is 23, not 24, so
+the first two terms overlap; and this uses UTF-16 code units while PBKDF2 above
+uses UTF-8, which genuinely disagree for non-ASCII keys. Only the top 16 bits go
+on the wire, in frame bytes 2 and 3.
+
+**Heartbeat cadence**: every 60 s by default, not 5 s. PowerToys defaults its own
+`HeartbeatIntervalSeconds` to 300 (clamped 60..3600) and only expires a peer after
+`HEARTBEAT_TIMEOUT`, which is 1,500,000 ms (`Core/MachineStuff.cs:32`). Liveness
+is really handled by TCP keepalive.
 
 ## Cursor Switching Protocol
 
@@ -101,9 +138,11 @@ sequenceDiagram
 Offset  Size  Field
 ──────  ────  ─────
 0       1     Type (PackageType enum)
-1       1     Checksum (sum of bytes 2-31)
+1       1     Checksum (sum of bytes 2-31 — ONLY those, even on a 64-byte
+              frame; bytes 32-63 are unauthenticated, and that is deliberate)
 2-3     2     Magic number (24-bit hash of security key)
-4-7     4     Packet ID (int32, little-endian, must be non-zero)
+4-7     4     Packet ID (int32, little-endian; the peer's dedup ring is
+              zero-initialised, so never send 0)
 8-11    4     Src machine ID (uint32)
 12-15   4     Des machine ID (uint32, or 255=broadcast)
 16-31   16    Payload union (Mouse/Keyboard/Handshake data)

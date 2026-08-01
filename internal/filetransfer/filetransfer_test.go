@@ -198,8 +198,8 @@ func TestDestPath_StaysInsideDir(t *testing.T) {
 // --- streaming ---
 
 // wire builds what a real sender puts on the stream: the fixed header followed
-// by a block-aligned body, since the transport is raw AES-CBC and only ever
-// carries whole blocks.
+// by a body padded the way MWB pads it, so the receive-side tests are driven by
+// bytes a C# peer would actually produce.
 func wire(t *testing.T, h Header, body []byte) []byte {
 	t.Helper()
 	hdr, err := EncodeHeader(h)
@@ -422,7 +422,7 @@ func TestReceive_TruncatedInlineIsShortBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	in := bytes.NewReader(append(hdr, make([]byte, blockSize)...))
+	in := bytes.NewReader(append(hdr, make([]byte, readAlignBlock)...))
 
 	if _, err := Receive(in, dir, DefaultMaxSize); !errors.Is(err, ErrShortBody) {
 		t.Errorf("err = %v, want ErrShortBody", err)
@@ -457,26 +457,79 @@ func TestReceive_CreatesDestinationDirectory(t *testing.T) {
 	}
 }
 
-// --- block alignment ---
+// --- alignment ---
 
-// The transport is raw AES-CBC: EncryptWriter refuses a partial block and
-// DecryptReader consumes a whole one regardless of the caller's buffer. Every
-// size that is not a multiple of 16 exercises the padding path, and getting it
-// wrong truncates the tail of the file.
+// recordingWriter keeps the length of every individual write so a test can hold
+// the sender to the transport's rule rather than only to the total.
+type recordingWriter struct {
+	bytes.Buffer
+	writes []int
+}
+
+func (r *recordingWriter) Write(p []byte) (int, error) {
+	r.writes = append(r.writes, len(p))
+	return r.Buffer.Write(p)
+}
+
+// The wire length is dictated by MWB, not by the cipher: the C# file sender pads
+// with PACKAGE_SIZE - (sentCount % PACKAGE_SIZE) (Class/SocketStuff.cs:1920),
+// which is 1..32 by construction, so an already 32-aligned body still gets a
+// full extra 32 zero bytes. Anything else is not byte-for-byte.
+func TestWriteAligned_WireLengthIsMWBExact(t *testing.T) {
+	for _, size := range []int64{0, 1, 15, 16, 17, 31, 32, 33, 64, 1000} {
+		body := bytes.Repeat([]byte{0xAB}, int(size))
+		want := size + 32 - (size % 32)
+
+		var wire bytes.Buffer
+		sent, err := writeAligned(&wire, bytes.NewReader(body), size)
+		if err != nil {
+			t.Fatalf("size %d: %v", size, err)
+		}
+		if sent != size {
+			t.Errorf("size %d: reported %d bytes of payload", size, sent)
+		}
+		if int64(wire.Len()) != want {
+			t.Errorf("size %d: wire = %d bytes, want %d", size, wire.Len(), want)
+		}
+		if !bytes.Equal(wire.Bytes()[:size], body) {
+			t.Errorf("size %d: payload was altered", size)
+		}
+		if !bytes.Equal(wire.Bytes()[size:], make([]byte, want-size)) {
+			t.Errorf("size %d: padding = %v, want zeros", size, wire.Bytes()[size:])
+		}
+	}
+}
+
+// EncryptWriter rejects any write that is not a whole number of AES blocks, and
+// a 32-boundary pad is usually not one (28 bytes, say), so the padding has to be
+// merged into the final write instead of issued on its own.
+func TestWriteAligned_EveryWriteIsWholeAESBlocks(t *testing.T) {
+	for _, size := range []int64{0, 1, 15, 16, 17, 31, 32, 33, 64, 1000, copyBufSize, copyBufSize + 7, copyBufSize*2 + 31} {
+		w := &recordingWriter{}
+		if _, err := writeAligned(w, bytes.NewReader(bytes.Repeat([]byte{0x5A}, int(size))), size); err != nil {
+			t.Fatalf("size %d: %v", size, err)
+		}
+		if len(w.writes) == 0 {
+			t.Errorf("size %d: nothing was written; MWB always emits at least the trailing package", size)
+		}
+		for i, n := range w.writes {
+			if n%16 != 0 {
+				t.Errorf("size %d: write %d is %d bytes, which EncryptWriter would refuse", size, i, n)
+			}
+		}
+	}
+}
+
+// The receive side rounds to 16 and the send side pads to 32 on purpose. Every
+// size that is not a multiple of either exercises the padding path, and getting
+// it wrong truncates the tail of the file.
 func TestAlignedRoundTrip_AllTailLengths(t *testing.T) {
-	for size := 0; size <= 64; size++ {
+	for size := 0; size <= 96; size++ {
 		body := bytes.Repeat([]byte{0xAB}, size)
 
 		var wire bytes.Buffer
-		sent, err := writeAligned(&wire, bytes.NewReader(body), int64(size))
-		if err != nil {
+		if _, err := writeAligned(&wire, bytes.NewReader(body), int64(size)); err != nil {
 			t.Fatalf("size %d: writeAligned: %v", size, err)
-		}
-		if sent != int64(size) {
-			t.Fatalf("size %d: sent %d", size, sent)
-		}
-		if wire.Len()%blockSize != 0 {
-			t.Fatalf("size %d: wire is %d bytes, not block aligned", size, wire.Len())
 		}
 
 		var out bytes.Buffer
@@ -490,20 +543,6 @@ func TestAlignedRoundTrip_AllTailLengths(t *testing.T) {
 	}
 }
 
-// Padding must be zeros, not leftover buffer contents from a previous chunk.
-func TestWriteAligned_PadsWithZeros(t *testing.T) {
-	var wire bytes.Buffer
-	if _, err := writeAligned(&wire, bytes.NewReader([]byte("abc")), 3); err != nil {
-		t.Fatal(err)
-	}
-	if wire.Len() != blockSize {
-		t.Fatalf("wire = %d bytes, want %d", wire.Len(), blockSize)
-	}
-	if !bytes.Equal(wire.Bytes()[3:], make([]byte, blockSize-3)) {
-		t.Errorf("padding = %v, want zeros", wire.Bytes()[3:])
-	}
-}
-
 // Sizes spanning multiple buffer fills must stay aligned throughout.
 func TestAlignedRoundTrip_LargeUnaligned(t *testing.T) {
 	const size = copyBufSize*2 + 7
@@ -513,8 +552,8 @@ func TestAlignedRoundTrip_LargeUnaligned(t *testing.T) {
 	if _, err := writeAligned(&wire, bytes.NewReader(body), size); err != nil {
 		t.Fatal(err)
 	}
-	if wire.Len()%blockSize != 0 {
-		t.Fatalf("wire is %d bytes, not block aligned", wire.Len())
+	if int64(wire.Len()) != sendAlignedLen(size) {
+		t.Fatalf("wire is %d bytes, want %d", wire.Len(), sendAlignedLen(size))
 	}
 
 	var out bytes.Buffer
@@ -526,10 +565,72 @@ func TestAlignedRoundTrip_LargeUnaligned(t *testing.T) {
 	}
 }
 
-func TestAlignedLen(t *testing.T) {
+// csInlineWire is what MWB's inline clipboard sender actually puts on the wire.
+// SendData appends (sentCount % PACKAGE_SIZE) bytes (Class/SocketStuff.cs:1991),
+// an inverted expression that aligns nothing; the CryptoStream then zero-pads
+// the tail to the AES block (PaddingMode.Zeros, Core/Encryption.cs:95). We must
+// not copy the bug on send, but we do have to read what it produces.
+func csInlineWire(body []byte) []byte {
+	out := append([]byte(nil), body...)
+	out = append(out, make([]byte, len(body)%32)...)
+	if rem := len(out) % 16; rem != 0 {
+		out = append(out, make([]byte, 16-rem)...)
+	}
+	return out
+}
+
+// Rounding reads up to 32 would break real C# inline images: for L % 32 in 1..8
+// the inline sender emits fewer than 32*ceil(L/32) bytes, so a 32-boundary
+// reader would wait for bytes that never arrive and then fail with
+// ErrShortBody. (At L % 32 == 0 the wire is already 32-aligned, so that case is
+// safe either way — the hazard is specifically the 1..8 remainders.)
+func TestReadAligned_AcceptsSixteenAlignedInlineBody(t *testing.T) {
+	sharper := 0
+
+	for size := 1; size <= 200; size++ {
+		body := bytes.Repeat([]byte{0xC3}, size)
+		wire := csInlineWire(body)
+
+		if len(wire)%16 != 0 {
+			t.Fatalf("size %d: emulated C# wire is %d bytes, not a whole AES block", size, len(wire))
+		}
+		if readAlignedLen(int64(size)) > int64(len(wire)) {
+			t.Fatalf("size %d: reader wants %d bytes but C# only sends %d", size, readAlignedLen(int64(size)), len(wire))
+		}
+		// Count the sizes where a 32-rounding READER would overrun the wire.
+		// Comparing sendAlignedLen here instead would be vacuous: the send pad
+		// always adds a whole extra package, so it exceeds the inline wire for
+		// every 32-aligned size regardless of the read boundary.
+		if (int64(size)+31)/32*32 > int64(len(wire)) {
+			sharper++
+		}
+
+		var out bytes.Buffer
+		got, err := readAligned(&out, bytes.NewReader(wire), int64(size))
+		if err != nil {
+			t.Fatalf("size %d: %v", size, err)
+		}
+		if got != int64(size) || !bytes.Equal(out.Bytes(), body) {
+			t.Errorf("size %d: recovered %d bytes %q", size, got, out.Bytes())
+		}
+	}
+
+	// Guard the reason the two boundaries differ: if this ever hits zero the
+	// comment above is stale and the read side could be simplified.
+	if sharper == 0 {
+		t.Error("no size where a 32-boundary read would overrun the C# inline sender; the split boundaries need re-justifying")
+	}
+}
+
+func TestAlignedLenHelpers(t *testing.T) {
 	for in, want := range map[int64]int64{0: 0, 1: 16, 15: 16, 16: 16, 17: 32, 1024: 1024, 1025: 1040} {
-		if got := alignedLen(in); got != want {
-			t.Errorf("alignedLen(%d) = %d, want %d", in, got, want)
+		if got := readAlignedLen(in); got != want {
+			t.Errorf("readAlignedLen(%d) = %d, want %d", in, got, want)
+		}
+	}
+	for in, want := range map[int64]int64{0: 32, 1: 32, 31: 32, 32: 64, 33: 64, 64: 96, 1000: 1024} {
+		if got := sendAlignedLen(in); got != want {
+			t.Errorf("sendAlignedLen(%d) = %d, want %d", in, got, want)
 		}
 	}
 }

@@ -1,1 +1,11 @@
-KERNEL=="uinput", GROUP="input", MODE="0660"
+# Let members of the "input" group open /dev/uinput, which mwb needs to create
+# its virtual mouse and keyboard.
+#
+# OPTIONS+="static_node=uinput" is load-bearing: without it the mode is only
+# applied once the uinput module is loaded, and a non-root open fails on
+# permissions *before* the on-demand autoload can trigger. That is the classic
+# "my udev rule does nothing" symptom.
+#
+# Pair this with /etc/modules-load.d/uinput.conf containing "uinput", and with
+# `usermod -aG input <user>` followed by a fresh login.
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"

@@ -1,13 +1,39 @@
-# MWB Linux Configuration
-# Get the security key from PowerToys -> Mouse Without Borders on Windows.
+# MWB Linux configuration.
+#
+# The security key comes from PowerToys -> Mouse Without Borders on Windows.
+# Copy it VERBATIM: PowerToys stores it exactly as displayed, so whitespace and
+# case both matter. Verify with `mwb hash` against the "magic: a,b,c" line in
+# %LOCALAPPDATA%\Microsoft\PowerToys\MouseWithoutBorders\Logs before anything else.
 
 host = "192.168.1.100"        # Windows machine IP address
-key = "YourSecurityKey"       # Security key from PowerToys MWB
-name = "linux"                # This machine's name (max 15 chars)
-# port = 15100                # Base port (default 15100)
-# remote_width = 1920         # Remote screen width in pixels
-# remote_height = 1080        # Remote screen height in pixels
-# edge = "left"               # Screen edge for switching: "left" or "right"
-# clipboard = true            # Set false to disable clipboard sync
-# accel_multiplier = 2.0      # Linux -> Windows cursor speed
-# inbound_multiplier = 1.0    # Windows -> Linux cursor speed
+key  = "YourSecurityKey"      # must match PowerToys character for character
+name = "linux"                # must also appear in the Windows machine matrix
+
+# --- Optional -------------------------------------------------------------
+
+# port = 15100                # control is port+1 (15101), bulk is port (15100)
+# edge = "left"               # which Linux screen edge hands control to Windows
+# clipboard = true            # false disables clipboard sync
+# file_transfer = true        # false disables the bulk file channel
+# keyboard_layout = "auto"    # us, de, fr, be, es, it, gb, pt, nordic, ch, nl
+
+# Cursor speed. accel_multiplier scales Linux -> Windows movement; MWB itself
+# normalises coordinates, so 1.0 is the faithful setting and anything else is a
+# personal preference.
+# accel_multiplier = 1.0
+# inbound_multiplier = 1.0    # Windows -> Linux
+
+# How often we announce ourselves so the peer keeps us in its machine pool.
+# Clamped to 60..3600, matching the clamp PowerToys applies to its own setting.
+# Windows only expires a peer after 25 minutes, so this is not latency-critical.
+# heartbeat_seconds = 60
+
+# PBKDF2 rounds used to derive the AES key. This MUST match the Windows build:
+# 50000 for PowerToys up to commit 3bf6820 (2026-06-29), 100000 for current
+# upstream main. A mismatch is indistinguishable from a wrong security key.
+# pbkdf2_iterations = 50000
+
+# Pin this machine's MWB identity instead of persisting one in
+# $XDG_STATE_HOME/mwb/machine_id. 0 = persist automatically. Must not be 0 or
+# 255, which are reserved (ID.NONE and ID.ALL).
+# machine_id = 0

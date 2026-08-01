@@ -20,7 +20,7 @@ import (
 	"github.com/lucky-verma/mwb-linux/internal/filetransfer"
 	"github.com/lucky-verma/mwb-linux/internal/input"
 	"github.com/lucky-verma/mwb-linux/internal/network"
-	"github.com/lucky-verma/mwb-linux/internal/selfupdate"
+	"github.com/lucky-verma/mwb-linux/internal/protocol"
 )
 
 // version is stamped at release time via -ldflags "-X main.version=...".
@@ -44,25 +44,58 @@ func runSubcommand() bool {
 		fmt.Println("mwb", version)
 		return true
 
-	case "update":
-		fs := flag.NewFlagSet("update", flag.ExitOnError)
-		checkOnly := fs.Bool("check", false, "report whether an update exists without installing it")
-		force := fs.Bool("force", false, "reinstall even when already up to date")
+	case "hash":
+		fs := flag.NewFlagSet("hash", flag.ExitOnError)
+		key := fs.String("key", "", "security key (default: read from config)")
+		cfgPath := fs.String("config", "", "path to config.toml")
 		_ = fs.Parse(os.Args[2:])
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-
-		err := selfupdate.Run(ctx, selfupdate.Options{
-			CurrentVersion: version,
-			CheckOnly:      *checkOnly,
-			Force:          *force,
-		})
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "update failed:", err)
-			os.Exit(1)
+		securityKey := *key
+		iterations := protocol.DefaultPBKDF2Iterations
+		if securityKey == "" {
+			path := *cfgPath
+			if path == "" {
+				home, _ := os.UserHomeDir()
+				path = filepath.Join(home, ".config", "mwb", "config.toml")
+			}
+			cfg, err := config.Load(path)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				fmt.Fprintln(os.Stderr, "pass --key to hash a key without a config file")
+				os.Exit(1)
+			}
+			securityKey = cfg.Key
+			// Report the count this install will actually use, not the default:
+			// disambiguating that is half the point of the subcommand.
+			iterations = cfg.KeyDerivationIterations()
 		}
+
+		magic, h0, h1, hLast := protocol.MagicDetail(securityKey)
+		fmt.Printf("key length      : %d\n", len(securityKey))
+		fmt.Printf("magic           : 0x%08X (%d)\n", magic, magic)
+		fmt.Printf("wire bytes [2,3]: 0x%02X 0x%02X\n", byte(magic>>16), byte(magic>>24))
+		fmt.Printf("pbkdf2 iters    : %d\n", iterations)
+		fmt.Println()
+		fmt.Printf("PowerToys logs this line at startup — it must match exactly:\n")
+		fmt.Printf("  magic: %d,%d,%d\n", h0, h1, hLast)
+		fmt.Println()
+		fmt.Println("If it does not match, the two machines have different security keys.")
+		fmt.Println("Windows log: %LOCALAPPDATA%\\Microsoft\\PowerToys\\MouseWithoutBorders\\Logs")
 		return true
+
+	case "update":
+		// Deliberately removed. Upstream lucky-verma/mwb-linux releases are built
+		// against the pre-June-2026 MWB crypto (a fixed PBKDF2 salt and a fixed
+		// IV), so self-updating would silently replace this binary with one that
+		// cannot complete a handshake against a current PowerToys build. Rebuild
+		// from source instead.
+		fmt.Fprintln(os.Stderr, "mwb: self-update is disabled in this fork.")
+		fmt.Fprintln(os.Stderr, "Upstream releases use the older fixed-salt crypto and cannot")
+		fmt.Fprintln(os.Stderr, "talk to a current PowerToys peer. Rebuild from source instead:")
+		fmt.Fprintln(os.Stderr, "    git pull && make build")
+		os.Exit(1)
+		return true
+
 	}
 	return false
 }
@@ -110,10 +143,38 @@ func main() {
 	// Clipboard runs by default. Either config (clipboard = false) or the
 	// --no-clipboard flag disables it; the flag wins over config.
 	clipboardEnabled := cfg.ClipboardEnabled() && !*noClipboard
+
+	// Bidirectional input is off unless config or the flag turns it on, so a
+	// stray config can never silently start grabbing the real input devices.
+	bidiEnabled := cfg.BidirectionalEnabled() || *bidirectional
 	keyboardLayout := input.ResolveKeyboardLayout(cfg.KeyboardLayout)
 
+	// A stable identity, persisted across restarts. PowerToys treats the machine
+	// id as an identity rather than a nonce (Class/Setting.cs:1089-1106): it keys
+	// the bulk clipboard channel's accept check (Core/Clipboard.cs:840), routes
+	// directed packets (Core/Common.cs:926), and is written into the peer's
+	// saved "name:id" pool. A fresh id per connection breaks all three.
+	machineID, err := cfg.ResolveMachineID("")
+	if err != nil {
+		// A usable id is still returned when only persistence failed; that
+		// degrades to "stable until restart" rather than being fatal.
+		slog.Warn("could not persist the machine id; it will change on restart", "err", err)
+	}
+	if err := network.SetMachineID(machineID); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	network.SetPBKDF2Iterations(cfg.KeyDerivationIterations())
+	network.SetHeartbeatInterval(cfg.HeartbeatInterval())
+
 	slog.Debug("debug logging enabled")
-	slog.Info("mwb starting", "host", cfg.Host, "port", cfg.MessagePort(), "name", cfg.Name, "bidirectional", *bidirectional, "edge", *edgeSide, "clipboard", clipboardEnabled, "keyboard_layout", keyboardLayout)
+	slog.Info("mwb starting",
+		"host", cfg.Host, "port", cfg.MessagePort(), "name", cfg.Name,
+		"machineID", machineID, "bidirectional", bidiEnabled, "edge", *edgeSide,
+		"clipboard", clipboardEnabled, "keyboard_layout", keyboardLayout,
+		"pbkdf2Iterations", network.PBKDF2Iterations(),
+		"heartbeat", network.HeartbeatInterval())
 
 	mouse, err := input.CreateVirtualMouse("mwb-mouse")
 	if err != nil {
@@ -196,7 +257,11 @@ func main() {
 	go func() {
 		for {
 			// Race: try outbound connect AND accept inbound — first one wins
-			addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.MessagePort())
+			// host may list several addresses for the same peer (Wi-Fi and a
+			// direct Ethernet link, say). We dial the first; all of them are
+			// accepted inbound, which is the direction that matters when the
+			// peer's firewall blocks our outbound.
+			addr := fmt.Sprintf("%s:%d", network.DialTarget(cfg.Host), cfg.MessagePort())
 			slog.Info("connecting", "addr", addr)
 
 			connectStop := make(chan struct{})
@@ -209,15 +274,31 @@ func main() {
 				connectStop,
 			)
 
-			// Wait for either outbound or inbound connection
+			// Wait for either outbound or inbound connection.
+			//
+			// Both channels are closed on shutdown, and a receive from a closed
+			// channel yields nil — so this must be checked before use, or
+			// SIGTERM arriving mid-connect panics on conn.RemoteName.
 			var conn *network.Conn
+			var inbound bool
 			select {
 			case conn = <-outgoingCh:
-				slog.Info("connected (outbound)", "remote", conn.RemoteName)
 			case conn = <-incomingCh:
-				slog.Info("connected (inbound)", "remote", conn.RemoteName)
+				inbound = true
+			case <-serverStop:
+				close(connectStop)
+				return
 			}
 			close(connectStop)
+			if conn == nil {
+				slog.Info("connection attempt cancelled during shutdown")
+				return
+			}
+			if inbound {
+				slog.Info("connected (inbound)", "remote", conn.RemoteName)
+			} else {
+				slog.Info("connected (outbound)", "remote", conn.RemoteName)
+			}
 			activeMachineID.Store(conn.MachineID)
 			handler.OnBecameActive = nil
 			handler.OnActivated = nil
@@ -258,7 +339,7 @@ func main() {
 
 			// Start bidirectional capture if enabled
 			var cap *capture.Capturer
-			if *bidirectional {
+			if bidiEnabled {
 				screen := capture.GetScreenSizeXrandr()
 				slog.Info("screen detected", "width", screen.Width, "height", screen.Height)
 

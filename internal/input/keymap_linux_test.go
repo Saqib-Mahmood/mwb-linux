@@ -3,7 +3,11 @@
 // internal/input/keymap_linux_test.go
 package input
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/lucky-verma/mwb-linux/internal/protocol"
+)
 
 func TestVKToKeyCode(t *testing.T) {
 	tests := []struct {
@@ -127,6 +131,157 @@ func TestVKToKeyCodeForCommonLayoutProfiles(t *testing.T) {
 	}
 }
 
+func TestVKToKeyCodeExtended(t *testing.T) {
+	tests := []struct {
+		name     string
+		vk       int32
+		extended bool
+		want     uint16
+	}{
+		// The plain form of an arrow VK stays on the nav cluster on purpose; see the
+		// vkMap doc comment. Both rows lock that choice in.
+		{"VK_LEFT extended", 0x25, true, KEY_LEFT},
+		{"VK_LEFT plain", 0x25, false, KEY_LEFT},
+		{"VK_RETURN plain", 0x0D, false, KEY_ENTER},
+		{"VK_RETURN extended", 0x0D, true, KEY_KPENTER},
+		{"VK_DELETE extended", 0x2E, true, KEY_DELETE},
+		{"VK_CONTROL extended", 0x11, true, KEY_RIGHTCTRL},
+		{"VK_MENU extended", 0x12, true, KEY_RIGHTALT},
+		// VK_SHIFT is not in extendedVKMap: neither Shift is E0-prefixed.
+		{"VK_SHIFT extended falls through", 0x10, true, KEY_LEFTSHIFT},
+		// Generic modifiers arrive from MWB's hotkey replay / ReleaseAllKeys.
+		{"VK_SHIFT plain", 0x10, false, KEY_LEFTSHIFT},
+		{"VK_CONTROL plain", 0x11, false, KEY_LEFTCTRL},
+		{"VK_MENU plain", 0x12, false, KEY_LEFTALT},
+		{"VK_PAUSE extended falls through", 0x13, true, KEY_PAUSE},
+		{"VK_NUMPAD4 extended falls through", 0x64, true, KEY_KP4},
+		{"VK_MEDIA_NEXT_TRACK", 0xB0, false, KEY_NEXTSONG},
+		{"VK_MEDIA_PREV_TRACK", 0xB1, false, KEY_PREVIOUSSONG},
+		{"VK_MEDIA_STOP", 0xB2, false, KEY_STOPCD},
+		{"VK_MEDIA_PLAY_PAUSE", 0xB3, false, KEY_PLAYPAUSE},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := VKToKeyCodeExtended(tt.vk, tt.extended, "us")
+			if !ok || got != tt.want {
+				t.Errorf("VKToKeyCodeExtended(0x%X, %v) = %d, %v; want %d, true",
+					tt.vk, tt.extended, got, ok, tt.want)
+			}
+		})
+	}
+}
+
+func TestVKToKeyCodeExtendedUnknownVK(t *testing.T) {
+	if _, ok := VKToKeyCodeExtended(0xFFF, true, "us"); ok {
+		t.Error("VKToKeyCodeExtended(0xFFF, true) = ok; want miss")
+	}
+}
+
+func TestVKToKeyCodeExtendedKeepsLayoutFallback(t *testing.T) {
+	// Extended lookups miss for letters, so the layout override must still apply.
+	got, ok := VKToKeyCodeExtended(0x5A, true, "de")
+	if !ok || got != KEY_Y {
+		t.Errorf("VKToKeyCodeExtended(0x5A, true, de) = %d, %v; want %d, true", got, ok, KEY_Y)
+	}
+}
+
+// Unregistered evdev codes are silently dropped by the kernel, so every extended
+// target must be passed to UI_SET_KEYBIT.
+func TestUsedKeyCodesCoversExtendedMap(t *testing.T) {
+	registered := make(map[uint16]struct{})
+	for _, code := range usedKeyCodes() {
+		registered[code] = struct{}{}
+	}
+	for vk, code := range extendedVKMap {
+		if _, ok := registered[code]; !ok {
+			t.Errorf("extended VK 0x%X target %d missing from usedKeyCodes()", vk, code)
+		}
+	}
+	for _, code := range []uint16{KEY_KPENTER, KEY_NEXTSONG, KEY_PLAYPAUSE, KEY_PREVIOUSSONG, KEY_STOPCD} {
+		if _, ok := registered[code]; !ok {
+			t.Errorf("key code %d missing from usedKeyCodes()", code)
+		}
+	}
+}
+
+func TestUsedKeyCodesSortedAndDeduplicated(t *testing.T) {
+	codes := usedKeyCodes()
+	for i := 1; i < len(codes); i++ {
+		if codes[i] <= codes[i-1] {
+			t.Fatalf("usedKeyCodes() not strictly increasing at %d: %v", i, codes[i-1:i+1])
+		}
+	}
+}
+
+func TestKeyCodeToVKFlags(t *testing.T) {
+	tests := []struct {
+		name      string
+		code      uint16
+		wantVK    int32
+		wantFlags int32
+	}{
+		{"numpad enter", KEY_KPENTER, 0x0D, protocol.LLKHF_EXTENDED},
+		{"main enter", KEY_ENTER, 0x0D, 0},
+		{"right ctrl", KEY_RIGHTCTRL, 0xA3, protocol.LLKHF_EXTENDED},
+		{"left ctrl", KEY_LEFTCTRL, 0xA2, 0},
+		{"right alt", KEY_RIGHTALT, 0xA5, protocol.LLKHF_EXTENDED},
+		// Two VKs reach these codes; the inversion must report the side-specific one
+		// a real low-level hook would, not the generic 0x10/0x12.
+		{"left shift", KEY_LEFTSHIFT, 0xA0, 0},
+		{"left alt", KEY_LEFTALT, 0xA4, 0},
+		{"arrow left", KEY_LEFT, 0x25, protocol.LLKHF_EXTENDED},
+		{"delete", KEY_DELETE, 0x2E, protocol.LLKHF_EXTENDED},
+		{"numpad slash", KEY_KPSLASH, 0x6F, protocol.LLKHF_EXTENDED},
+		{"numlock", KEY_NUMLOCK, 0x90, protocol.LLKHF_EXTENDED},
+		{"left meta", KEY_LEFTMETA, 0x5B, protocol.LLKHF_EXTENDED},
+		{"volume up", KEY_VOLUMEUP, 0xAF, protocol.LLKHF_EXTENDED},
+		{"next song", KEY_NEXTSONG, 0xB0, protocol.LLKHF_EXTENDED},
+		{"numpad 4", KEY_KP4, 0x64, 0},
+		{"numpad 5 prefers VK_NUMPAD5", KEY_KP5, 0x65, 0},
+		{"letter a", KEY_A, 0x41, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vk, flags, ok := KeyCodeToVKFlags(tt.code)
+			if !ok || vk != tt.wantVK || flags != tt.wantFlags {
+				t.Errorf("KeyCodeToVKFlags(%d) = 0x%X, 0x%X, %v; want 0x%X, 0x%X, true",
+					tt.code, vk, flags, ok, tt.wantVK, tt.wantFlags)
+			}
+		})
+	}
+}
+
+func TestKeyCodeToVKFlagsUnknownCode(t *testing.T) {
+	if _, _, ok := KeyCodeToVKFlags(KEY_MAX); ok {
+		t.Error("KeyCodeToVKFlags(KEY_MAX) = ok; want miss")
+	}
+}
+
+// Every extended-class evdev code must survive the Linux -> Windows -> Linux trip.
+func TestKeyCodeToVKFlagsRoundTripsExtendedKeys(t *testing.T) {
+	for _, code := range usedKeyCodes() {
+		vk, flags, ok := KeyCodeToVKFlags(code)
+		if !ok {
+			t.Errorf("KeyCodeToVKFlags(%d) missing", code)
+			continue
+		}
+		extended := flags&protocol.LLKHF_EXTENDED != 0
+		got, ok := VKToKeyCodeExtended(vk, extended, "us")
+		if !ok || got != code {
+			t.Errorf("round trip of %d via VK 0x%X (extended=%v) = %d, %v", code, vk, extended, got, ok)
+		}
+	}
+}
+
+func TestKeyCodeToVKStillResolvesNumpadEnter(t *testing.T) {
+	// The two-return form cannot carry the E0 bit, so it degrades to main Enter
+	// rather than dropping the event; internal/capture still calls it.
+	vk, ok := KeyCodeToVK(KEY_KPENTER)
+	if !ok || vk != 0x0D {
+		t.Errorf("KeyCodeToVK(KEY_KPENTER) = 0x%X, %v; want 0xD, true", vk, ok)
+	}
+}
+
 func TestCanonicalKeyboardLayout(t *testing.T) {
 	tests := map[string]string{
 		"":               "",
@@ -154,6 +309,24 @@ func TestCanonicalKeyboardLayout(t *testing.T) {
 	for input, want := range tests {
 		if got := CanonicalKeyboardLayout(input); got != want {
 			t.Errorf("CanonicalKeyboardLayout(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+// TestVKClearIsDeliberatelyUnmapped guards a decision that looks like an
+// omission.
+//
+// VK_CLEAR (0x0C) is what Windows sends for numpad 5 with NumLock off. Mapping
+// it to KEY_KP5 would type "5" whenever the *Linux* seat has NumLock on,
+// because we inject an evdev keycode and XKB applies the local NumLock state.
+// Windows-to-Windows types nothing there: SendKey injects the virtual key
+// without KEYEVENTF_SCANCODE (Class/InputSimulation.cs:137-140). Core/VK.cs
+// does not declare VK_CLEAR at all. Dropping the key is the faithful behaviour.
+func TestVKClearIsDeliberatelyUnmapped(t *testing.T) {
+	for _, extended := range []bool{false, true} {
+		if code, ok := VKToKeyCodeExtended(0x0C, extended, "us"); ok {
+			t.Errorf("VK_CLEAR(extended=%v) resolved to %d; it must stay unmapped so it "+
+				"is dropped rather than typing a digit under local NumLock", extended, code)
 		}
 	}
 }

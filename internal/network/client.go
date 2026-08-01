@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,37 +34,187 @@ type Conn struct {
 	RemoteID   uint32
 	LocalName  string
 	RemoteName string
-	nextID     atomic.Int32
 	sendMu     sync.Mutex // guards enc.Write — CBC mode is not goroutine-safe
+
+	// readIdleTimeout, when set, makes Reader() refresh the read deadline
+	// before every read. Used on the bulk file channel; see idleReader.
+	readIdleTimeout time.Duration
 }
 
-// Cached key material — PBKDF2 is expensive (50k iterations), only derive once.
+// The magic number is salt-independent and expensive to compute (SHA-512 chained
+// 50,000 times), so it stays cached process-wide. The AES key cannot be cached:
+// since PowerToys PR #48742 every stream derives its own key from a fresh random
+// salt, in each direction independently.
 var (
 	keyMu        sync.Mutex
-	cachedAESKey []byte
-	cachedIV     []byte
 	cachedMagic  uint32
 	cachedSecret string
+	cachedValid  bool
 )
 
-func getCachedKeyMaterial(securityKey string) ([]byte, []byte, uint32) {
+func getCachedMagic(securityKey string) uint32 {
 	keyMu.Lock()
 	defer keyMu.Unlock()
-	if securityKey == cachedSecret && cachedAESKey != nil {
-		return cachedAESKey, cachedIV, cachedMagic
+	if cachedValid && securityKey == cachedSecret {
+		return cachedMagic
 	}
-	cachedAESKey = protocol.DeriveKey(securityKey)
-	cachedIV = protocol.FixedIV()
 	cachedMagic = protocol.Get24BitHash(securityKey)
 	cachedSecret = securityKey
-	return cachedAESKey, cachedIV, cachedMagic
+	cachedValid = true
+	return cachedMagic
 }
 
-// newSecureStream configures TCP options, creates the AES-CBC streams and
-// performs the IV block exchange. It stops before the handshake, because the
-// file-transfer channel shares this encrypted prefix but continues differently
-// on the adjacent clipboard port: it sends a raw Clipboard/ClipboardPush DATA
-// struct where the control channel sends a stamped Handshake packet.
+// machineID is this installation's MWB identity. PowerToys treats the machine
+// ID as a stable identity, not a nonce: it generates one random int32 once and
+// persists it (Class/Setting.cs:1089-1106).
+//
+// It must be the same for every connection and across restarts, because:
+//
+//   - The bulk clipboard/file channel is gated on
+//     `MachinePool.ResolveID(name) == package.Src` (Core/Clipboard.cs:840); the
+//     id we stamp there has to equal whatever our last control heartbeat wrote
+//     into the peer's pool.
+//   - MWB normally holds two sockets per peer (one dialled each way) and routes
+//     purely by id (Core/Common.cs:926). Two different ids means only one socket
+//     is addressable, and directed input can be sent into the other one.
+//   - Windows persists "name:id" and reloads it at startup
+//     (Core/InitAndCleanup.cs:47-58), treating the peer as alive for the full
+//     HEARTBEAT_TIMEOUT. A stale id makes the first switch attempt fail and
+//     control snap straight back to Windows (Core/Common.cs:948-966).
+//
+// A zero value here means "not configured"; MachineID() then falls back to a
+// process-lifetime random id so tests and ad-hoc runs still work.
+var machineID atomic.Uint32
+
+// SetMachineID installs the persisted identity. Call once at startup, before
+// any connection is made. 0 (ID.NONE) and 255 (ID.ALL) are reserved
+// (Core/ID.cs) and are rejected.
+func SetMachineID(id uint32) error {
+	if id == 0 || id == 255 {
+		return fmt.Errorf("machine id %d is reserved (0 = NONE, 255 = ALL)", id)
+	}
+	machineID.Store(id)
+	return nil
+}
+
+// MachineID reports the identity stamped on outgoing packets.
+func MachineID() uint32 {
+	if id := machineID.Load(); id != 0 {
+		return id
+	}
+	// Nothing configured — mint one for this process so behaviour stays sane,
+	// and keep it stable from here on rather than re-rolling per connection.
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		machineID.CompareAndSwap(0, 1)
+		return machineID.Load()
+	}
+	id := binary.BigEndian.Uint32(b[:])&0x7FFFFFFE | 1
+	if id == 255 {
+		id = 256
+	}
+	machineID.CompareAndSwap(0, id)
+	return machineID.Load()
+}
+
+// packetID is the outbound packet counter. It is process-global and randomly
+// seeded, both deliberately.
+//
+// The peer filters duplicates with a 50-entry ring of recently seen ids
+// (Core/Receiver.cs:30-79) that is `static` — shared by every socket, never
+// reset when a connection drops, and, critically, NOT updated on a hit: a
+// colliding packet is discarded without evicting anything.
+//
+// PowerToys' own counter matches that: Package.PackageID is process-global
+// (Core/Package.cs:22), incremented via Interlocked (Core/Common.cs:916), and
+// even survives restarts by being saved to and reloaded from settings
+// (Class/SocketStuff.cs:231, :367).
+//
+// A per-connection counter starting at 1 therefore replays ids after every
+// reconnect. The handshake burns the first ~20 (exempt from the filter), so the
+// first *recorded* id is around 21 every time — and if the previous session was
+// short, those ids are still in the peer's ring. The result is that our
+// registration heartbeat and first input packets are silently dropped, with no
+// error anywhere, until the counter climbs past the stale entries.
+//
+// Random seeding extends the same protection across process restarts, where the
+// peer's ring outlives us entirely. The chance of landing inside a 50-entry
+// window is ~50/2^31.
+var packetID atomic.Int32
+
+// nextPacketID returns the id for the next outbound packet. Never 0: the peer's
+// ring is zero-initialised, so an id of 0 is indistinguishable from an empty
+// slot and would be dropped as a phantom duplicate forever.
+func nextPacketID() int32 {
+	for {
+		cur := packetID.Load()
+		if cur == 0 {
+			var b [4]byte
+			seed := int32(1)
+			if _, err := rand.Read(b[:]); err == nil {
+				// Keep well clear of the wrap point so a long-lived process
+				// does not reach it.
+				seed = int32(binary.BigEndian.Uint32(b[:])&0x3FFFFFFF) | 1
+			}
+			if !packetID.CompareAndSwap(0, seed) {
+				continue
+			}
+			cur = seed
+		}
+		next := cur + 1
+		if next >= 0x7FFFFF00 || next <= 0 {
+			next = 1
+		}
+		if packetID.CompareAndSwap(cur, next) {
+			return next
+		}
+	}
+}
+
+// pbkdf2Iterations is the PBKDF2 round count used for every new stream. It is a
+// process-wide knob rather than a parameter because it must match whatever the
+// Windows peer was built with, and every connection path funnels through
+// newSecureStream. The reference build uses 50,000; current PowerToys main uses
+// 100,000. SetPBKDF2Iterations lets the reconnect loop probe the other value —
+// a mismatch is indistinguishable from a wrong security key, because both
+// produce garbage plaintext that fails the magic/checksum test.
+var pbkdf2Iterations atomic.Int64
+
+// SetPBKDF2Iterations overrides the PBKDF2 round count for subsequent streams.
+// Passing a non-positive value restores the default.
+func SetPBKDF2Iterations(n int) {
+	if n <= 0 {
+		n = protocol.DefaultPBKDF2Iterations
+	}
+	pbkdf2Iterations.Store(int64(n))
+}
+
+// PBKDF2Iterations reports the round count new streams will use.
+func PBKDF2Iterations() int {
+	if n := pbkdf2Iterations.Load(); n > 0 {
+		return int(n)
+	}
+	return protocol.DefaultPBKDF2Iterations
+}
+
+// newSecureStream configures TCP options, exchanges the cleartext stream
+// prologue, creates the AES-CBC streams and exchanges the encrypted primer
+// block. It stops before the handshake, because the file-transfer channel
+// shares this encrypted prefix but continues differently on the adjacent
+// clipboard port: it sends a raw Clipboard/ClipboardPush DATA struct where the
+// control channel sends a stamped Handshake packet.
+//
+// Wire order per direction, mirroring PowerToys Core/Encryption.cs
+// GetEncryptedStream/GetDecryptedStream plus Core/Common.cs
+// SendOrReceiveARandomDataBlockPerInitialIV:
+//
+//	salt(16) || IV(16)   cleartext, on the raw socket
+//	E(primer 16)         through the cipher, discarded by the reader
+//	E(frames...)
+//
+// The two directions are fully independent: different salts, different IVs and
+// therefore different AES keys. Both peers write their prologue before reading
+// the peer's, so this cannot deadlock.
 func newSecureStream(raw net.Conn, securityKey, machineName string, timeout time.Duration) (*Conn, error) {
 	if timeout <= 0 {
 		timeout = handshakeTimeout
@@ -71,7 +223,8 @@ func newSecureStream(raw net.Conn, securityKey, machineName string, timeout time
 		return nil, fmt.Errorf("set handshake deadline: %w", err)
 	}
 
-	aesKey, iv, magic := getCachedKeyMaterial(securityKey)
+	magic := getCachedMagic(securityKey)
+	iterations := PBKDF2Iterations()
 
 	if tc, ok := raw.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
@@ -82,32 +235,46 @@ func newSecureStream(raw net.Conn, securityKey, machineName string, timeout time
 		_ = tc.SetReadBuffer(320 * 1024)
 	}
 
-	enc, err := protocol.NewEncryptWriter(raw, aesKey, iv)
+	// Cleartext prologue. Write ours first, then read theirs: writing through
+	// `raw` deliberately bypasses the cipher, which does not exist yet.
+	txSalt, txIV, err := protocol.NewPrologue()
+	if err != nil {
+		return nil, err
+	}
+	prologue := make([]byte, 0, protocol.PrologueSize)
+	prologue = append(prologue, txSalt...)
+	prologue = append(prologue, txIV...)
+	if _, err := raw.Write(prologue); err != nil {
+		return nil, fmt.Errorf("send stream prologue: %w", err)
+	}
+	rxPrologue := make([]byte, protocol.PrologueSize)
+	if _, err := io.ReadFull(raw, rxPrologue); err != nil {
+		return nil, fmt.Errorf("read stream prologue: %w", err)
+	}
+	rxSalt, rxIV := rxPrologue[:protocol.SaltSize], rxPrologue[protocol.SaltSize:]
+
+	enc, err := protocol.NewEncryptWriter(raw, protocol.DeriveKey(securityKey, txSalt, iterations), txIV)
 	if err != nil {
 		return nil, fmt.Errorf("encrypt stream: %w", err)
 	}
-	dec, err := protocol.NewDecryptReader(raw, aesKey, iv)
+	dec, err := protocol.NewDecryptReader(raw, protocol.DeriveKey(securityKey, rxSalt, iterations), rxIV)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt stream: %w", err)
 	}
 
-	// IV exchange: send random 16-byte block, read peer's random block
-	ranData := make([]byte, 16)
+	// Primer: one throwaway block through the cipher in each direction, so the
+	// first real frame is never the first block encrypted under this IV.
+	// Consumed 1:1, so plaintext and ciphertext byte counts stay equal.
+	ranData := make([]byte, protocol.IVSize)
 	if _, err := rand.Read(ranData); err != nil {
 		return nil, fmt.Errorf("rand: %w", err)
 	}
 	if _, err := enc.Write(ranData); err != nil {
-		return nil, fmt.Errorf("send IV block: %w", err)
+		return nil, fmt.Errorf("send primer block: %w", err)
 	}
-	peerRan := make([]byte, 16)
+	peerRan := make([]byte, protocol.IVSize)
 	if _, err := io.ReadFull(dec, peerRan); err != nil {
-		return nil, fmt.Errorf("read IV block: %w", err)
-	}
-
-	// Generate a machine ID from random data
-	machineID := uint32(ranData[0])<<24 | uint32(ranData[1])<<16 | uint32(ranData[2])<<8 | uint32(ranData[3])
-	if machineID == 0 || machineID == 255 {
-		machineID = 1
+		return nil, fmt.Errorf("read primer block: %w", err)
 	}
 
 	c := &Conn{
@@ -115,7 +282,7 @@ func newSecureStream(raw net.Conn, securityKey, machineName string, timeout time
 		enc:       enc,
 		dec:       dec,
 		magic:     magic,
-		MachineID: machineID,
+		MachineID: MachineID(),
 		LocalName: machineName,
 	}
 
@@ -231,24 +398,75 @@ func connectWithRetry(
 // resolveAllowedPeer resolves the configured host once when the listener
 // starts. Keeping DNS out of the accept loop prevents untrusted connection
 // attempts from triggering repeated blocking lookups.
+// resolveAllowedPeer resolves the configured peer(s) to the set of addresses an
+// inbound connection may come from.
+//
+// allowedHost may name several addresses, comma-separated. That matters because
+// the same peer often reaches us over more than one path — a Wi-Fi address and a
+// direct-Ethernet address, say — and MWB dials every address it holds for a
+// machine in parallel (Class/SocketStuff.cs:944-957 accumulates all matching
+// Name2IP lines, then :941-943 starts a client thread per address). Whichever
+// link is up wins, so both have to be accepted here or the connection is
+// rejected as coming from an unexpected source.
 func resolveAllowedPeer(allowedHost string) ([]net.IP, error) {
-	if allowedHost == "" {
+	if strings.TrimSpace(allowedHost) == "" {
 		return nil, fmt.Errorf("configured host is empty")
 	}
-	if ip := net.ParseIP(allowedHost); ip != nil {
-		return []net.IP{ip}, nil
+
+	var out []net.IP
+	seen := make(map[string]bool)
+	var firstErr error
+
+	for _, entry := range strings.Split(allowedHost, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+
+		var ips []net.IP
+		if ip := net.ParseIP(entry); ip != nil {
+			ips = []net.IP{ip}
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), peerResolutionTimeout)
+			resolved, err := net.DefaultResolver.LookupIP(ctx, "ip", entry)
+			cancel()
+			if err != nil {
+				// One unresolvable name must not disable the addresses that did
+				// resolve: a direct-Ethernet peer has no DNS entry at all.
+				if firstErr == nil {
+					firstErr = fmt.Errorf("resolve %q: %w", entry, err)
+				}
+				continue
+			}
+			ips = resolved
+		}
+
+		for _, ip := range ips {
+			if key := ip.String(); !seen[key] {
+				seen[key] = true
+				out = append(out, ip)
+			}
+		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), peerResolutionTimeout)
-	defer cancel()
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", allowedHost)
-	if err != nil {
-		return nil, err
-	}
-	if len(ips) == 0 {
+	if len(out) == 0 {
+		if firstErr != nil {
+			return nil, firstErr
+		}
 		return nil, fmt.Errorf("no IP addresses found")
 	}
-	return ips, nil
+	return out, nil
+}
+
+// DialTarget is the address the outbound connector should try: the first entry
+// of a possibly comma-separated host list.
+func DialTarget(allowedHost string) string {
+	for _, entry := range strings.Split(allowedHost, ",") {
+		if entry = strings.TrimSpace(entry); entry != "" {
+			return entry
+		}
+	}
+	return allowedHost
 }
 
 // isAllowedPeer reports whether addr may attempt the handshake.
@@ -442,10 +660,17 @@ func ListenAndAccept(port int, securityKey, machineName, allowedHost string, onF
 						return
 					}
 
+					// Same treatment as the dedicated file listener: an idle
+					// read timeout instead of no deadline at all, so a
+					// live-but-silent peer cannot pin this goroutine, and a
+					// drain afterwards so the sender's 32-byte padding does not
+					// turn our Close into an RST.
 					if err := raw.SetDeadline(time.Time{}); err != nil {
 						slog.Warn("clear file transfer deadline", "err", err)
 					}
+					conn.SetReadIdleTimeout(fileReadIdleTimeout)
 					onFile(conn, first.Type == protocol.ClipboardPush)
+					drainToEOF(raw)
 					_ = raw.Close()
 					return
 				}
@@ -548,7 +773,40 @@ func (c *Conn) doHandshake(machineName string, first *protocol.Packet) error {
 
 // Reader exposes the decrypted stream. The file-transfer channel reads its
 // header and body directly from here rather than as packets.
-func (c *Conn) Reader() io.Reader { return c.dec }
+func (c *Conn) Reader() io.Reader {
+	if c.readIdleTimeout > 0 {
+		return &idleReader{conn: c.raw, r: c.dec, timeout: c.readIdleTimeout}
+	}
+	return c.dec
+}
+
+// SetReadIdleTimeout makes subsequent Reader() calls refresh the socket read
+// deadline before each read, so it is progress rather than total elapsed time
+// that keeps a transfer alive. Zero disables it.
+func (c *Conn) SetReadIdleTimeout(d time.Duration) { c.readIdleTimeout = d }
+
+// idleReader is the read-side mirror of idleWriter.
+//
+// It exists because a bulk transfer must not be allowed to block forever. The
+// C# peer keeps a 30-second ReceiveTimeout in force for the whole clipboard
+// exchange — Core/Clipboard.cs:795 sets it in ShakeHand and nothing ever resets
+// it, so it still applies while ReceiveAndProcessClipboardData streams the body.
+// Clearing our deadline outright let a live-but-silent peer park a transfer
+// goroutine indefinitely, which in turn wedged listener shutdown: the goroutine
+// holds a WaitGroup that SIGTERM handling waits on. TCP keepalive does not help
+// here, because the peer is reachable, just not sending.
+type idleReader struct {
+	conn    net.Conn // carries the deadline
+	r       io.Reader
+	timeout time.Duration
+}
+
+func (ir *idleReader) Read(p []byte) (int, error) {
+	if err := ir.conn.SetReadDeadline(time.Now().Add(ir.timeout)); err != nil {
+		return 0, fmt.Errorf("set file read deadline: %w", err)
+	}
+	return ir.r.Read(p)
+}
 
 // Writer exposes the encrypted stream for the same reason.
 func (c *Conn) Writer() io.Writer { return c.enc }
@@ -557,18 +815,31 @@ func (c *Conn) Writer() io.Writer { return c.enc }
 // matching OG MWB's SendTimeout to prevent stuck writes from blocking.
 // sendMu serializes all writes: cipher.CBCEncrypter mutates internal IV state
 // on every call and is not safe for concurrent use.
+// abort tears the socket down without the courtesy ByeBye. Closing the raw
+// connection is what unblocks ReceiveLoop's RecvPacket, which is the only path
+// that reaches the reconnect logic in main. Safe to call more than once.
+func (c *Conn) abort(reason string, err error) {
+	slog.Error("dropping the connection", "reason", reason, "err", err)
+	_ = c.raw.Close()
+}
+
 func (c *Conn) SendPacket(p *protocol.Packet) error {
-	// Wrap before reaching 0x7FFFFFFF — protocol requires non-zero, non-negative IDs.
-	if c.nextID.Load() >= 0x7FFFFF00 {
-		c.nextID.Store(0)
-	}
-	p.ID = c.nextID.Add(1)
+	p.ID = nextPacketID()
 	buf := p.Marshal()
 	protocol.StampPacket(buf, c.magic)
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 	_ = c.raw.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
 	_, err := c.enc.Write(buf)
+	if errors.Is(err, protocol.ErrStreamDesynced) {
+		// The cipher advanced over bytes that never reached the peer, so every
+		// frame from here on decodes as noise on their side. Several callers
+		// deliberately ignore the error from a single send — a dropped mouse
+		// packet is not worth a teardown — so if we merely returned it we would
+		// sit "connected" and mute forever. Tear the socket down instead and let
+		// the reconnect loop rebuild the stream.
+		c.abort("encrypted stream desynchronised", err)
+	}
 	return err
 }
 

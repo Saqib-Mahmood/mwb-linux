@@ -175,7 +175,8 @@ mkdir -p ~/.config/mwb
 cat > ~/.config/mwb/config.toml << EOF
 host = "192.168.1.100"        # Your Windows machine's IP
 key = "YourSecurityKey"       # From PowerToys MWB
-name = "linux"                # This machine's name (max 15 chars)
+name = "linux"                # This machine's name (max 32 chars, must match
+                              # the Windows machine matrix entry)
 keyboard_layout = "auto"      # Inbound keyboard layout profile
 EOF
 ```
@@ -287,11 +288,22 @@ keep the client on a trusted network segment.
 
 ### Windows Side Requirements
 
+> **Read [SETUP.md](SETUP.md) first.** This fork exists because upstream
+> `mwb-linux` cannot handshake against a current PowerToys build: PowerToys moved
+> to a per-connection random salt and IV in June 2026, and upstream still uses
+> the old fixed values. SETUP.md also covers `mwb hash`, which is the fastest way
+> to confirm the two machines share a security key.
+
 - **PowerToys** installed with Mouse Without Borders enabled
-- **"Move mouse relatively"** set to **OFF** (required for bidirectional mode)
+- **"Move mouse relatively"** set to **OFF** — recommended for first light, since
+  the absolute coordinate path is the simpler one. The relative path is now
+  implemented too, but is less well exercised.
 - **"Share clipboard"** set to **ON** (for clipboard sync)
 - **"Block screen saver on other machines"** set to **ON** (recommended, keeps connection alive)
-- Security key shared with Linux client
+- Security key shared with the Linux client — verify with `mwb hash`
+- **The Linux hostname must appear in the MWB machine matrix.** Without it,
+  `SkSend` never delivers broadcast frames (heartbeats, matrix, clipboard) to us,
+  so the handshake succeeds and then nothing else arrives.
 - Windows Firewall must allow ports **15100-15101** (TCP inbound/outbound)
 
 ## Troubleshooting
@@ -328,6 +340,15 @@ systemctl --user restart mwb
 ### Cursor bounces back immediately
 Set "Move mouse relatively" to OFF in PowerToys MWB settings.
 
+### Handshake succeeds, then nothing happens
+The Linux hostname is missing from the Windows machine matrix. Broadcast packets
+are only delivered to sockets whose machine name is in it.
+
+### "Magic number invalid!" in the Windows log
+Different security keys, or a PBKDF2 iteration-count mismatch. Compare
+`mwb hash` against the `magic: a,b,c` line PowerToys logs at startup; if those
+match, try `pbkdf2_iterations = 100000` in config.toml.
+
 ### Cursor returns from the far edge of the other laptop
 Upgrade to a build with directional `MachineSwitched`/`NextMachine` filtering.
 The Linux client should only accept return requests from the edge configured by
@@ -356,6 +377,8 @@ scripts/
 - **Keyboard on Windows lock screen** — Keyboard input may not work on the Windows lock screen (Winlogon desktop security restriction)
 - **Middle mouse button auto-scroll** — Middle-click auto-scroll (scroll lock mode) does not work in browsers; normal middle-click works
 - **First connection** — Initial handshake takes ~3-16s depending on Windows MWB state; subsequent reconnects are instant
+- **Self-update is disabled** — upstream release binaries carry the older
+  fixed-salt crypto and cannot talk to a current PowerToys peer. Rebuild from source.
 - **Bidirectional mode requires X11** — Edge detection uses `xdotool`. (Device isolation itself is display-server agnostic: `EVIOCGRAB` works identically on X11, Wayland and the console.) Receive-only mode works on Wayland (XWayland session). Native Wayland bidirectional support requires compositor extensions and is not yet implemented.
 - **Keyboard layout metadata** — PowerToys MWB keyboard packets carry Windows virtual-key codes and flags, but not hardware scan codes or Unicode text. MWB Linux uses `keyboard_layout` profiles for common layouts; unsupported profiles fall back to the original US-compatible mapping. Fully zero-config global layout support requires sender-side scan code or Unicode metadata.
 - **File copy is one file at a time** — Matching MWB itself, folders and

@@ -5,15 +5,54 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/lucky-verma/mwb-linux/internal/protocol"
 )
 
-// startHeartbeat sends periodic heartbeats to keep the connection alive.
-// Windows MWB drops clients that don't send heartbeats within ~10s.
+// DefaultHeartbeatInterval is how often we announce ourselves to the peer.
+//
+// PowerToys itself beats every HeartbeatIntervalSeconds — default 300, clamped
+// to 60..3600 (Class/Setting.cs, Form/frmScreen.cs) — and only considers a
+// machine dead after MachineStuff.HEARTBEAT_TIMEOUT, which is 1,500,000 ms.
+// The previous 5-second cadence here was based on a mistaken belief that
+// Windows drops silent clients within ~10s; it does not. 60s is comfortably
+// inside every timeout while still refreshing the peer's machine pool
+// promptly after a reconnect.
+//
+// Liveness is really handled by TCP keepalive, which newSecureStream enables.
+const DefaultHeartbeatInterval = 60 * time.Second
+
+// heartbeatInterval is a process-wide knob so config can override the cadence.
+var heartbeatInterval atomic.Int64
+
+// SetHeartbeatInterval overrides the heartbeat cadence for new connections.
+// Values outside PowerToys' own 60..3600 second clamp are pulled into range.
+func SetHeartbeatInterval(d time.Duration) {
+	switch {
+	case d <= 0:
+		d = DefaultHeartbeatInterval
+	case d < 60*time.Second:
+		d = 60 * time.Second
+	case d > 3600*time.Second:
+		d = 3600 * time.Second
+	}
+	heartbeatInterval.Store(int64(d))
+}
+
+// HeartbeatInterval reports the cadence new connections will use.
+func HeartbeatInterval() time.Duration {
+	if d := heartbeatInterval.Load(); d > 0 {
+		return time.Duration(d)
+	}
+	return DefaultHeartbeatInterval
+}
+
+// startHeartbeat sends periodic heartbeats so the peer keeps us in its machine
+// pool and its matrix tile stays live.
 func startHeartbeat(conn *Conn, stop chan struct{}) {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(HeartbeatInterval())
 	defer ticker.Stop()
 	for {
 		select {
@@ -27,7 +66,12 @@ func startHeartbeat(conn *Conn, stop chan struct{}) {
 			}
 			hb.SetMachineName(conn.LocalName)
 			if err := conn.SendPacket(hb); err != nil {
-				slog.Debug("heartbeat send failed", "err", err)
+				// Do not just stop beating. Nothing else on the send side can
+				// end the connection, so returning quietly here leaves the
+				// client wedged: still "connected", no longer announcing
+				// itself, and never reconnecting. Dropping the socket makes
+				// ReceiveLoop return, which is what reaches the reconnect path.
+				conn.abort("heartbeat send failed", err)
 				return
 			}
 		}
@@ -40,6 +84,8 @@ func ReceiveLoop(conn *Conn, handler *Handler) error {
 	go startHeartbeat(conn, stop)
 	defer close(stop)
 
+	var dedup packetDedup
+
 	for {
 		pkt, err := conn.RecvPacket()
 		if err != nil {
@@ -48,6 +94,11 @@ func ReceiveLoop(conn *Conn, handler *Handler) error {
 				return nil
 			}
 			return err
+		}
+
+		if dedup.seen(pkt) {
+			slog.Debug("duplicate packet dropped", "type", pkt.Type, "id", pkt.ID)
+			continue
 		}
 
 		switch pkt.Type {
