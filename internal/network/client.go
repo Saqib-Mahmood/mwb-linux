@@ -19,7 +19,12 @@ import (
 )
 
 const (
-	handshakeTimeout      = 10 * time.Second
+	handshakeTimeout = 10 * time.Second
+
+	// retryNoiseInterval is how often an ongoing outbound failure is repeated at
+	// WARN. Frequent enough to show the client is alive and stuck, rare enough
+	// not to bury anything else.
+	retryNoiseInterval    = 5 * time.Minute
 	peerResolutionTimeout = 3 * time.Second
 	maxPendingHandshakes  = 4
 )
@@ -365,9 +370,20 @@ func connectWithRetry(
 	go func() {
 		defer close(connCh)
 
+		var (
+			attempts  int
+			started   = time.Now()
+			lastNoise = time.Now()
+		)
+
 		for {
 			conn, err := connect()
 			if err == nil {
+				if attempts > 0 {
+					slog.Info("peer reachable again",
+						"afterAttempts", attempts,
+						"unreachableFor", time.Since(started).Truncate(time.Second))
+				}
 				select {
 				case connCh <- conn:
 				case <-stop:
@@ -376,7 +392,25 @@ func connectWithRetry(
 				return
 			}
 
-			slog.Debug("outbound connect failed; retrying", "err", err, "delay", retryDelay)
+			// Log the first failure, then throttle. At DEBUG only, a client that
+			// has been unable to reach its peer for hours looks identical in the
+			// journal to one that is happily connected — which is exactly the
+			// wrong thing to be ambiguous about. One line per attempt would be
+			// spam (a dial timeout is ~10s), so say it once and then
+			// periodically.
+			attempts++
+			switch {
+			case attempts == 1:
+				slog.Warn("cannot reach the peer; retrying in the background",
+					"err", err, "delay", retryDelay)
+			case time.Since(lastNoise) >= retryNoiseInterval:
+				lastNoise = time.Now()
+				slog.Warn("still cannot reach the peer",
+					"attempts", attempts, "since", time.Since(started).Truncate(time.Second),
+					"err", err)
+			default:
+				slog.Debug("outbound connect failed; retrying", "err", err, "delay", retryDelay)
+			}
 			timer := time.NewTimer(retryDelay)
 			select {
 			case <-timer.C:

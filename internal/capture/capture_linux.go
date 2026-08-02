@@ -173,9 +173,10 @@ func (c *Capturer) SetActive(active bool) {
 	// Calling it under the lock caused a deadlock that froze all goroutines.
 	if shouldEnable {
 		// Same reasoning as the virtual-edge return in pollCursorEdge: control
-		// is coming back to us, so release whatever we left held on the remote
-		// before we stop forwarding its key-ups.
-		c.releaseRemoteKeys()
+		// is coming back to us, so release whatever we left held on the remote.
+		// In the background, so its network sends cannot delay handing local
+		// input back — see that path for the detail.
+		go c.releaseRemoteKeys()
 		c.applyIsolation()
 		if onActivated != nil {
 			onActivated()
@@ -975,10 +976,19 @@ func (c *Capturer) handleRel(ev inputEvent) {
 		c.canSwitch = false // block re-trigger until cursor moves away from edge
 		c.mu.Unlock()
 
-		// Let go of anything we are still holding down on the remote, before we
-		// stop forwarding. The user may well be mid-chord; the physical key-up
-		// is about to land locally instead, so the remote would never hear it.
-		c.releaseRemoteKeys()
+		// Let go of anything we are still holding down on the remote — the user
+		// may be mid-chord, and the physical key-up is about to land locally
+		// instead, so the remote would never hear it.
+		//
+		// Off the critical path deliberately. These are network sends and
+		// SendPacket carries a 500ms write deadline, so doing them here would
+		// keep the local devices grabbed — i.e. the mouse frozen — for as long
+		// as the socket takes. Forwarding has already stopped (active is true,
+		// so handleEvent early-returns), so nothing local leaks to the remote
+		// while this runs.
+		go c.releaseRemoteKeys()
+
+		returnStart := time.Now()
 
 		// Move cursor away from edge SYNCHRONOUSLY before releasing the grab.
 		// Ordering is load-bearing: release first and in-flight physical mouse
@@ -1000,6 +1010,10 @@ func (c *Capturer) handleRel(ev inputEvent) {
 		cancel()
 
 		c.applyIsolation()
+		// Everything above runs with local input still grabbed, so this is the
+		// window in which the mouse is unresponsive after coming back.
+		slog.Debug("switch-back complete", "frozenFor", time.Since(returnStart))
+
 		if onActivated != nil {
 			onActivated()
 		}
