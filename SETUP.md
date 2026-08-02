@@ -470,6 +470,7 @@ Work top-down; each row is cheaper to check than the one below.
 | Cursor **jumps** rather than crossing smoothly | `switch_entry_px` too large. MWB lands 2px inside the edge; the inherited default here was 200px. Try `2`. |
 | Noticeable **pause** just after a switch | `switch_grace_ms`. MWB suppresses no input at all; try `-1`. Remaining latency is the 10ms edge-detection poll, which is inherent to the xdotool-based detection. |
 | Cursor **bounces back** immediately after crossing | `switch_entry_px` too small — it must clear the peer's 1px trigger (`SKIP_PIXELS`). Raise it. |
+| Cursor **reappears inside the screen** on returning, not at the border | The return entry inset. It follows `switch_entry_px` (default 8px); it used to be a flat 100px. |
 | Mouse **freezes briefly on returning** to Linux | Local devices stay grabbed until the return sequence finishes. Anything slow in it — network sends especially — is felt directly. `mwb --debug` logs `switch-back complete frozenFor=…`; anything over a few ms wants investigating. |
 | Numpad arrows type digits | Extended-flag mapping; check the arriving keycode with `xev`. |
 | Modifier stuck down after a switch | Report it — the release paths are implemented but lightly tested on real hardware. |

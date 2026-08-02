@@ -55,28 +55,69 @@ func TestApplyAcceleration_Multiplier(t *testing.T) {
 
 // --- SafeEntryPosition ---
 
+// The returning cursor must land AT the shared border, not well inside it.
+//
+// This used to assert x >= 50px, encoding the idea that distance is what stops
+// the cursor bouncing straight back out. It is not: the canSwitch gate in
+// pollCursorEdge requires the cursor to travel inward before another switch-out
+// is allowed. Distance was doing nothing except making the return visibly
+// discontinuous — the cursor reappeared ~100px inside the screen instead of at
+// the edge it had just crossed.
+//
+// The only real constraint is clearing our own 1px switch-out trigger.
 func TestSafeEntryPosition_LeftEdge(t *testing.T) {
-	c := &Capturer{screen: ScreenInfo{Width: 2560, Height: 1440}, edgeSide: "left"}
-	x, y := c.SafeEntryPosition()
-	// Must be 100px from left edge — not at x=0 which immediately re-triggers switch
-	if x < 50 {
-		t.Errorf("left edge: x=%d too close to edge, cursor will re-trigger switch", x)
+	c := &Capturer{
+		screen: ScreenInfo{Width: 2560, Height: 1440}, edgeSide: "left",
+		switchEntryPx: defaultSwitchEntryPx,
 	}
-	// Y should be somewhere reasonable (not 0, not at edge)
+	x, y := c.SafeEntryPosition()
+
+	if x < 2 {
+		t.Errorf("left edge: x=%d is inside the 1px switch-out trigger", x)
+	}
+	if x > 50 {
+		t.Errorf("left edge: x=%d is too far inside — the return should look "+
+			"continuous, landing at the border rather than jumping inward", x)
+	}
 	if y <= 0 || y >= 1440 {
 		t.Errorf("left edge: y=%d out of screen bounds", y)
 	}
 }
 
 func TestSafeEntryPosition_RightEdge(t *testing.T) {
-	c := &Capturer{screen: ScreenInfo{Width: 2560, Height: 1440}, edgeSide: "right"}
+	c := &Capturer{
+		screen: ScreenInfo{Width: 2560, Height: 1440}, edgeSide: "right",
+		switchEntryPx: defaultSwitchEntryPx,
+	}
 	x, y := c.SafeEntryPosition()
-	// Must be 100px from right edge
-	if x > 2560-50 {
-		t.Errorf("right edge: x=%d too close to right edge, cursor will re-trigger switch", x)
+
+	if x > 2560-2 {
+		t.Errorf("right edge: x=%d is inside the 1px switch-out trigger", x)
+	}
+	if x < 2560-50 {
+		t.Errorf("right edge: x=%d is too far inside — the return should look "+
+			"continuous, landing at the border rather than jumping inward", x)
 	}
 	if y <= 0 || y >= 1440 {
 		t.Errorf("right edge: y=%d out of screen bounds", y)
+	}
+}
+
+// The entry inset follows the configured value, so it can be tuned without a
+// rebuild if a particular mouse or screen needs more clearance.
+func TestSafeEntryPositionHonoursConfiguredInset(t *testing.T) {
+	c := &Capturer{
+		screen: ScreenInfo{Width: 2560, Height: 1440}, edgeSide: "right",
+		switchEntryPx: 2, // exactly MWB's own JUMP_PIXELS
+	}
+	if x, _ := c.SafeEntryPosition(); x != 2558 {
+		t.Errorf("x=%d, want 2558 (2px inside the right edge)", x)
+	}
+
+	// A zero value must not put the cursor on the trigger itself.
+	c.switchEntryPx = 0
+	if x, _ := c.SafeEntryPosition(); x != 2560-defaultSwitchEntryPx {
+		t.Errorf("x=%d, want the default inset applied", x)
 	}
 }
 

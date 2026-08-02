@@ -191,17 +191,27 @@ func (c *Capturer) IsActive() bool {
 	return c.active
 }
 
-// SafeEntryPosition returns a cursor position 100px inside from the switch edge,
-// safe to move to after MachineSwitched without immediately re-triggering the edge.
+// SafeEntryPosition returns where to place the cursor when control comes back to
+// this machine, just inside the shared edge.
+//
+// It used to be a flat 100px, which is why the cursor visibly reappeared well
+// inside the screen instead of at the border it had just crossed. The offset
+// only has to keep the cursor clear of our own 1px switch-out trigger; the
+// canSwitch gate (see pollCursorEdge) is what actually stops it bouncing back
+// out, so this can be small enough to look continuous.
 func (c *Capturer) SafeEntryPosition() (x, y int32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	y = c.screen.Height / 2
+	inset := c.switchEntryPx
+	if inset < 1 {
+		inset = defaultSwitchEntryPx
+	}
 	switch c.edgeSide {
 	case "left":
-		x = 100
+		x = inset
 	case "right":
-		x = c.screen.Width - 100
+		x = c.screen.Width - inset
 	default:
 		x = c.screen.Width / 2
 	}
@@ -498,7 +508,15 @@ func (c *Capturer) pollCursorEdge() {
 			// Track whether cursor has been away from the edge since activation
 			// This prevents loops: cursor must move inward first, then back to edge
 			c.mu.Lock()
-			edgeZone := int32(20) // pixels from edge — must move this far inward to re-arm
+			// Must move this far inward before another switch-out is allowed.
+			//
+			// Deliberately larger than the entry inset: landing at the border is
+			// what makes a return look continuous, and this gate is then the
+			// only thing preventing leftover momentum from carrying the cursor
+			// straight back out again. The cost is that you cannot re-cross
+			// immediately after returning without moving inward first, which is
+			// the desired behaviour anyway.
+			edgeZone := int32(20)
 			switch c.edgeSide {
 			case "left":
 				if x > edgeZone {
@@ -994,11 +1012,17 @@ func (c *Capturer) handleRel(ev inputEvent) {
 		// Ordering is load-bearing: release first and in-flight physical mouse
 		// motion drives the cursor straight back into the edge, bouncing the
 		// switch. Move first, then hand input back.
+		c.mu.Lock()
+		inset := c.switchEntryPx
+		c.mu.Unlock()
+		if inset < 1 {
+			inset = defaultSwitchEntryPx
+		}
 		var entryX int32
 		if c.edgeSide == "left" {
-			entryX = 100
+			entryX = inset
 		} else {
-			entryX = c.screen.Width - 100
+			entryX = c.screen.Width - inset
 		}
 		entryY := int32(float64(remY) / float64(remH) * float64(c.screen.Height))
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
