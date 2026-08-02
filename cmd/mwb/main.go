@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -240,7 +241,19 @@ func main() {
 	incomingCh, err := network.ListenAndAccept(cfg.MessagePort(), cfg.Key, cfg.Name, cfg.Host, onFile, serverStop)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error starting listener: %v\n", err)
-		fmt.Fprintln(os.Stderr, "Is another mwb instance already running?")
+		// Almost always the enabled user service already holding the port, which
+		// is easy to forget when running by hand. Name the fix rather than
+		// leaving it as a question.
+		if strings.Contains(err.Error(), "address already in use") {
+			fmt.Fprintln(os.Stderr)
+			fmt.Fprintln(os.Stderr, "Another mwb is already running — most likely the background service.")
+			fmt.Fprintln(os.Stderr, "  systemctl --user status mwb     # confirm")
+			fmt.Fprintln(os.Stderr, "  systemctl --user stop mwb       # then re-run this by hand")
+			fmt.Fprintln(os.Stderr, "  systemctl --user start mwb      # restore it afterwards")
+			fmt.Fprintln(os.Stderr)
+			fmt.Fprintln(os.Stderr, "Or just watch the running one instead:")
+			fmt.Fprintln(os.Stderr, "  journalctl --user -u mwb -f")
+		}
 		os.Exit(1)
 	}
 	defer close(serverStop)
