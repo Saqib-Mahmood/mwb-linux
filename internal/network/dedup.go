@@ -46,15 +46,23 @@ func dedupExempt(pt protocol.PackageType) bool {
 }
 
 // seen records the packet and reports whether it is a duplicate that should be
-// dropped. Exempt types are always allowed through and are not recorded.
+// dropped. Exempt types, and packets with no id, are always allowed through and
+// are not recorded.
 //
-// Unlike the C# ring, which is zero-initialised and therefore silently drops
-// any packet whose id is genuinely 0, this tracks slot validity separately. A
-// stray id of 0 is processed rather than swallowed; erring toward one extra
-// duplicate is safer than losing real input. Our own outbound ids start at 1
-// (SendPacket), so this asymmetry is not observable to the peer.
+// An id of 0 means the sender never assigned one, so it carries no sequence
+// information and cannot be deduplicated meaningfully. PowerToys emits such
+// packets routinely: anything sent through TcpSend rather than SkSend skips the
+// id counter entirely, which includes the Hi liveness probe
+// (Core/Common.cs:822-836 builds `new DATA()` — id 0 — and calls TcpSend).
+// Windows sends those in bursts, so treating id 0 as a sequence number meant
+// the first one through and every later one dropped.
+//
+// The C# ring is zero-initialised and so drops ALL id-0 packets; it gets away
+// with that because its Hi handler does nothing that matters. Ours answers Hi
+// with Hello, so silently swallowing them is worse for us than for them.
+// Skipping them entirely is correct for both.
 func (d *packetDedup) seen(pkt *protocol.Packet) bool {
-	if pkt == nil || dedupExempt(pkt.Type) {
+	if pkt == nil || pkt.ID == 0 || dedupExempt(pkt.Type) {
 		return false
 	}
 

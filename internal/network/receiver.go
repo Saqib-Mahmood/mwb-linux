@@ -96,8 +96,13 @@ func ReceiveLoop(conn *Conn, handler *Handler) error {
 			return err
 		}
 
+		// Every inbound packet, before any filtering. Without this it is
+		// impossible to tell "the peer never sent it" from "we dropped it",
+		// which are very different problems with very different fixes.
+		slog.Debug("rx", "type", pkt.Type, "id", pkt.ID, "src", pkt.Src, "des", pkt.Des)
+
 		if dedup.seen(pkt) {
-			slog.Debug("duplicate packet dropped", "type", pkt.Type, "id", pkt.ID)
+			slog.Warn("duplicate packet dropped", "type", pkt.Type, "id", pkt.ID)
 			continue
 		}
 

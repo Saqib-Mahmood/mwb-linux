@@ -76,17 +76,30 @@ func TestDedupWindowEvicts(t *testing.T) {
 	}
 }
 
-// TestDedupZeroIDIsProcessed documents a deliberate divergence from the C#
-// ring, which is zero-initialised and therefore silently swallows any packet
-// whose id is genuinely 0. Losing real input is worse than replaying one
-// duplicate, so a zero id passes the first time.
-func TestDedupZeroIDIsProcessed(t *testing.T) {
+// An id of 0 means the sender never assigned one, so it is not a sequence
+// number and must never be deduplicated.
+//
+// PowerToys emits these routinely: anything sent via TcpSend rather than SkSend
+// skips the id counter, which includes the Hi liveness probe
+// (Core/Common.cs:822-836). Windows sends Hi in bursts, so treating 0 as a real
+// id let the first through and dropped all the rest — observed live as a flood
+// of "duplicate packet dropped type=2 id=0".
+func TestDedupNeverDropsZeroID(t *testing.T) {
 	var d packetDedup
-	if d.seen(pkt(protocol.Mouse, 0)) {
-		t.Fatal("a zero id must be processed, not swallowed as a phantom duplicate")
+	for i := 0; i < 20; i++ {
+		if d.seen(pkt(protocol.Hi, 0)) {
+			t.Fatalf("id 0 must never be treated as a duplicate (attempt %d)", i+1)
+		}
 	}
-	if !d.seen(pkt(protocol.Mouse, 0)) {
-		t.Fatal("a repeated zero id is still a duplicate")
+	// Nor may they consume ring slots and evict real ids.
+	if d.seen(pkt(protocol.Mouse, 42)) {
+		t.Fatal("id 42 should be new")
+	}
+	for i := 0; i < 60; i++ {
+		d.seen(pkt(protocol.Hi, 0))
+	}
+	if !d.seen(pkt(protocol.Mouse, 42)) {
+		t.Error("id-0 packets must not evict remembered ids from the ring")
 	}
 }
 
