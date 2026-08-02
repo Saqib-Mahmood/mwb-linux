@@ -13,6 +13,7 @@ running, including each trap that is easy to hit.
 - [Step 5 — the Windows side](#step-5--the-windows-side)
 - [Step 6 — run it](#step-6--run-it)
 - [Auto-start and auto-restart](#auto-start-and-auto-restart)
+- [Turning on debug logging](#turning-on-debug-logging)
 - [Direct Ethernet between two laptops](#direct-ethernet-between-two-laptops)
 - [Troubleshooting](#troubleshooting)
 - [Config reference](#config-reference)
@@ -383,6 +384,36 @@ Two non-obvious details, both of which silently break auto-restart:
   `systemctl --user is-active graphical-session.target`. The cost of using
   `default.target` is that the service may start before X is ready; the restart
   loop absorbs that.
+
+---
+
+## Turning on debug logging
+
+The service runs at INFO. For diagnosis, per-packet logging is invaluable — it
+is what distinguishes "the peer never sent it" from "we dropped it", which look
+identical otherwise. Enable it with a drop-in, so the shipped unit stays clean:
+
+```sh
+systemctl --user edit mwb
+```
+
+```ini
+[Service]
+ExecStart=
+ExecStart=%h/.local/bin/mwb --debug
+```
+
+The empty `ExecStart=` is required — without it systemd appends rather than
+replaces. Then:
+
+```sh
+systemctl --user restart mwb
+journalctl --user -u mwb -f | grep "msg=rx"     # every inbound packet
+```
+
+Each line shows `type`, `id`, `src` and `des`. `des=255` is a broadcast
+(clipboard, heartbeats, matrix); anything else is addressed to us directly.
+Remove the drop-in with `systemctl --user revert mwb`.
 
 ---
 
